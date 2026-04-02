@@ -1,0 +1,253 @@
+services:
+  postgres:
+    image: postgres:15
+    container_name: ozon_postgres
+    restart: always
+    environment:
+      POSTGRES_DB: ozon
+      POSTGRES_USER: ozon
+      POSTGRES_PASSWORD: ozon
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ozon -d ozon"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    container_name: ozon_redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  backend:
+    build: ./backend
+    container_name: ozon_backend
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    expose:
+      - "8000"
+    environment:
+      PYTHONPATH: /app
+    working_dir: /app
+    volumes:
+      - ./backend:/app
+      - shared_exports:/shared_exports
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/healthz').read()"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    # Убрали дублирование environment, так как env_file уже загружает всё
+
+  frontend:
+    build: ./frontend
+    container_name: ozon_frontend
+    depends_on:
+      backend:
+        condition: service_healthy
+    expose:
+      - "3000"
+    environment:
+      - NEXT_PUBLIC_API_URL=/api
+      - INTERNAL_API_URL=http://backend:8000
+    volumes:
+      - ./frontend:/app
+      - /app/node_modules
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/login').then(r => process.exit(r.ok ? 0 : 1)).catch(() => process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: ozon_nginx
+    depends_on:
+      backend:
+        condition: service_healthy
+      frontend:
+        condition: service_healthy
+    ports:
+      - "3000:80"
+    volumes:
+      - ./nginx/default.conf:/etc/nginx/conf.d/default.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1/healthz >/dev/null && wget -q --spider http://127.0.0.1/login"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  nginx_exporter:
+    image: nginx/nginx-prometheus-exporter:1.4.1
+    container_name: ozon_nginx_exporter
+    depends_on:
+      nginx:
+        condition: service_healthy
+    command:
+      - --nginx.scrape-uri=http://nginx/nginx_status
+    expose:
+      - "9113"
+
+  worker:
+    build: ./worker
+    container_name: ozon_worker
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app/backend
+      - ./worker:/app/worker
+      - shared_exports:/shared_exports
+    expose:
+      - "9808"
+    environment:
+      - PYTHONPATH=/app
+      - PROMETHEUS_MULTIPROC_DIR=/tmp/worker-prometheus
+      - WORKER_METRICS_PORT=9808
+    command: celery -A worker.worker worker --loglevel=info --concurrency=4
+
+  beat:
+    build: ./worker
+    container_name: ozon_beat
+    env_file:
+      - .env
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app/backend
+      - ./worker:/app/worker
+    environment:
+      - PYTHONPATH=/app
+    command: celery -A worker.beat beat --loglevel=info
+
+  postgres_exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.15.0
+    container_name: ozon_postgres_exporter
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DATA_SOURCE_URI: postgres:5432/ozon?sslmode=disable
+      DATA_SOURCE_USER: ozon
+      DATA_SOURCE_PASS: ozon
+    expose:
+      - "9187"
+
+  redis_exporter:
+    image: oliver006/redis_exporter:v1.67.0
+    container_name: ozon_redis_exporter
+    depends_on:
+      redis:
+        condition: service_healthy
+    environment:
+      REDIS_ADDR: redis://redis:6379
+    expose:
+      - "9121"
+
+  prometheus:
+    image: prom/prometheus:v2.54.1
+    container_name: ozon_prometheus
+    depends_on:
+      alertmanager:
+        condition: service_started
+      backend:
+        condition: service_healthy
+      worker:
+        condition: service_started
+      postgres_exporter:
+        condition: service_started
+      redis_exporter:
+        condition: service_started
+      nginx_exporter:
+        condition: service_started
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus_data:/prometheus
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    container_name: ozon_alertmanager
+    env_file:
+      - .env
+    ports:
+      - "9093:9093"
+    entrypoint:
+      - /bin/sh
+      - -c
+    command:
+      - |
+        sed "s|__TELEGRAM_TOKEN__|$$TELEGRAM_TOKEN|g; s|__TELEGRAM_CHAT_ID__|$$TELEGRAM_CHAT_ID|g" \
+          /etc/alertmanager/alertmanager.yml.tpl > /tmp/alertmanager.yml && \
+        exec /bin/alertmanager --config.file=/tmp/alertmanager.yml
+    volumes:
+      - ./observability/alertmanager/alertmanager.yml.tpl:/etc/alertmanager/alertmanager.yml.tpl:ro
+      - ./observability/alertmanager/templates:/etc/alertmanager/templates:ro
+
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: ozon_grafana
+    depends_on:
+      prometheus:
+        condition: service_started
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+
+  bot:
+    build: ./bot
+    container_name: ozon_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    volumes:
+      - ./backend:/app/backend
+      - ./bot:/app/bot
+    environment:
+      - PYTHONPATH=/app
+    command: python bot/bot.py
+
+volumes:
+  postgres_data:
+  prometheus_data:
+  grafana_data:
+  shared_exports:

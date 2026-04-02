@@ -1,0 +1,144 @@
+groups:
+  - name: backend-alerts
+    rules:
+      - alert: BackendDown
+        expr: up{job="backend"} == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: backend
+        annotations:
+          summary: "Backend недоступен"
+          description: "Prometheus не может получить метрики backend больше 1 минуты."
+
+      - alert: BackendHigh5xxRate
+        expr: |
+          (
+            sum(rate(ozon_http_requests_total{status=~"5..", path!="/metrics"}[5m]))
+            /
+            clamp_min(sum(rate(ozon_http_requests_total{path!="/metrics"}[5m])), 0.001)
+          ) > 0.05
+          and
+          sum(rate(ozon_http_requests_total{path!="/metrics"}[5m])) > 0.1
+        for: 5m
+        labels:
+          severity: warning
+          service: backend
+        annotations:
+          summary: "У backend высокий процент 5xx"
+          description: "Доля ответов 5xx у backend держится выше 5% больше 5 минут."
+
+      - alert: BackendHighLatencyP95
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (le) (
+              rate(ozon_http_request_duration_seconds_bucket{path!="/healthz", path!="/metrics"}[5m])
+            )
+          ) > 1
+          and
+          sum(rate(ozon_http_request_duration_seconds_count{path!="/healthz", path!="/metrics"}[5m])) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          service: backend
+        annotations:
+          summary: "У backend вырос p95 latency"
+          description: "95-й перцентиль времени ответа backend выше 1 секунды больше 10 минут."
+
+      - alert: OverdueSuppliesDetected
+        expr: ozon_business_store_supplies_count{kind="overdue"} > 0
+        for: 15m
+        labels:
+          severity: warning
+          service: business
+        annotations:
+          summary: "Есть неотгруженные вовремя поставки: {{ $labels.store_name }}"
+          description: "У магазина {{ $labels.store_name }} (Store ID: {{ $labels.store_id }}) уже больше 15 минут есть поставки со статусом «Готова к отгрузке», у которых таймслот уже прошел."
+          store_name: "{{ $labels.store_name }}"
+          store_id: "{{ $labels.store_id }}"
+          overdue_count: '{{ printf "%.0f" $value }}'
+
+      - alert: PendingSupplyNotificationsStuck
+        expr: sum(ozon_business_pending_supply_event_count) > 0
+        for: 10m
+        labels:
+          severity: warning
+          service: business
+        annotations:
+          summary: "Зависли уведомления по поставкам"
+          description: "В очереди supply notification events есть неотправленные события уже больше 10 минут. Проверьте worker, Telegram и sync поставок."
+
+  - name: worker-alerts
+    rules:
+      - alert: WorkerMetricsDown
+        expr: up{job="worker"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          service: worker
+        annotations:
+          summary: "Worker метрики недоступны"
+          description: "Prometheus не может получить метрики Celery worker больше 2 минут."
+
+      - alert: WorkerRetriesSpiking
+        expr: sum by (task_name) (increase(ozon_celery_tasks_total{state=~"FAILURE|RETRY"}[15m])) > 3
+        for: 0m
+        labels:
+          severity: warning
+          service: worker
+        annotations:
+          summary: "У задач Celery много retry/failure"
+          description: "Задача {{ $labels.task_name }} накопила больше 3 retry/failure за последние 15 минут."
+
+  - name: infrastructure-alerts
+    rules:
+      - alert: PostgresDown
+        expr: pg_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: postgres
+        annotations:
+          summary: "PostgreSQL недоступен"
+          description: "postgres_exporter не может подключиться к PostgreSQL больше 1 минуты."
+
+      - alert: PostgresTooManyConnections
+        expr: sum(pg_stat_activity_count{datname="ozon"}) > 40
+        for: 10m
+        labels:
+          severity: warning
+          service: postgres
+        annotations:
+          summary: "У PostgreSQL много соединений"
+          description: "В базе ozon больше 40 соединений дольше 10 минут."
+
+      - alert: RedisDown
+        expr: redis_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: redis
+        annotations:
+          summary: "Redis недоступен"
+          description: "redis_exporter сообщает, что Redis недоступен больше 1 минуты."
+
+      - alert: RedisHighMemoryUsage
+        expr: redis_memory_used_bytes > 250 * 1024 * 1024
+        for: 10m
+        labels:
+          severity: warning
+          service: redis
+        annotations:
+          summary: "Redis потребляет много памяти"
+          description: "Redis использует больше 250 MB памяти дольше 10 минут."
+
+      - alert: NginxDown
+        expr: up{job="nginx"} == 0 or nginx_up == 0
+        for: 1m
+        labels:
+          severity: critical
+          service: nginx
+        annotations:
+          summary: "Nginx метрики недоступны"
+          description: "Prometheus не может получить метрики nginx/nginx_exporter больше 1 минуты."

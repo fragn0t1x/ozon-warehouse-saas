@@ -1,0 +1,19 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app:/app/backend
+
+WORKDIR /app
+
+COPY bot/requirements.txt /tmp/bot-requirements.txt
+RUN apt-get update && apt-get install -y --no-install-recommends netcat-openbsd && rm -rf /var/lib/apt/lists/* \
+    && pip install --no-cache-dir -r /tmp/bot-requirements.txt
+
+COPY bot /app/bot
+COPY backend /app/backend
+
+RUN useradd --create-home --uid 10001 appuser && chown -R appuser:appuser /app
+USER appuser
+
+CMD ["python", "bot/bot.py"]

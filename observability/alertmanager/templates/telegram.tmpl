@@ -1,0 +1,58 @@
+{{ define "telegram.default.message" }}
+{{- if eq .Status "firing" -}}
+🚨 <b>{{ .CommonLabels.alertname }}</b>
+{{- else -}}
+✅ <b>{{ .CommonLabels.alertname }}</b>
+{{- end }}
+
+<b>Статус:</b> {{ if eq .Status "firing" }}сработал{{ else }}восстановлен{{ end }}
+<b>Сервис:</b> {{ .CommonLabels.service }}
+<b>Severity:</b> {{ .CommonLabels.severity }}
+
+{{- if .CommonAnnotations.summary }}
+<b>Кратко:</b> {{ .CommonAnnotations.summary }}
+{{ end }}
+{{- if .CommonAnnotations.description }}
+<b>Описание:</b> {{ .CommonAnnotations.description }}
+{{ end }}
+
+<b>Количество алертов:</b> {{ len .Alerts }}
+{{- range .Alerts }}
+
+• <b>{{ .Labels.alertname }}</b>{{ if .Labels.task_name }} task={{ .Labels.task_name }}{{ end }}
+{{- end }}
+{{ end }}
+
+{{ define "telegram.business.message" }}
+⚠️ <b>{{ if .CommonAnnotations.summary }}{{ .CommonAnnotations.summary }}{{ else }}Бизнес-алерт{{ end }}</b>
+
+{{- if .CommonAnnotations.description }}
+{{ .CommonAnnotations.description }}
+{{ end }}
+
+<b>Количество алертов:</b> {{ len .Alerts }}
+{{- range .Alerts }}
+{{- if eq .Labels.alertname "OverdueSuppliesDetected" }}
+
+• <b>{{ if .Annotations.store_name }}{{ .Annotations.store_name }}{{ else if .Labels.store_name }}{{ .Labels.store_name }}{{ else }}Магазин не указан{{ end }}</b>
+{{- if or .Annotations.store_id .Labels.store_id }}
+  · Store ID: {{ if .Annotations.store_id }}{{ .Annotations.store_id }}{{ else }}{{ .Labels.store_id }}{{ end }}
+{{- end }}
+{{- if .Annotations.overdue_count }}
+  · Просроченных: {{ .Annotations.overdue_count }}
+{{- end }}
+{{- if .Annotations.description }}
+  {{ .Annotations.description }}
+{{- end }}
+{{- else if .Annotations.summary }}
+
+• {{ .Annotations.summary }}
+{{- if .Annotations.description }}
+  {{ .Annotations.description }}
+{{- end }}
+{{- else }}
+
+• {{ .Labels.alertname }}
+{{- end }}
+{{- end }}
+{{ end }}
