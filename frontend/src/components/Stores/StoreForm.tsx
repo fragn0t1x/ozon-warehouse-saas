@@ -489,7 +489,7 @@ export function StoreForm({ store, onClose, onSuccess }: StoreFormProps) {
               id="name"
               {...register('name', { required: 'Название обязательно' })}
               className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500 sm:text-sm text-gray-900 bg-white"
-              placeholder="Мой магазин"
+              placeholder="Например, основной магазин"
             />
             {errors.name && (
               <p className="mt-1 text-sm text-red-600">{errors.name.message}</p>
@@ -505,7 +505,7 @@ export function StoreForm({ store, onClose, onSuccess }: StoreFormProps) {
               id="client_id"
               {...register('client_id', { required: 'Client-ID обязателен' })}
               className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500 sm:text-sm text-gray-900 bg-white"
-              placeholder="3148949"
+              placeholder="Введите Client-ID"
               disabled={!!store}
             />
             {errors.client_id && (
@@ -525,7 +525,7 @@ export function StoreForm({ store, onClose, onSuccess }: StoreFormProps) {
                 required: store ? false : 'API ключ обязателен'
               })}
               className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-primary-500 focus:ring-primary-500 sm:text-sm text-gray-900 bg-white"
-              placeholder={store ? '••••••••' : '00037614-6794-4032-adef-3ef8164b4794'}
+              placeholder={store ? '••••••••' : 'Введите API ключ'}
             />
             {errors.api_key && (
               <p className="mt-1 text-sm text-red-600">{errors.api_key.message}</p>
