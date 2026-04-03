@@ -1614,13 +1614,13 @@ def today_supplies_task():
                     admin_telegram_count = 0
                     supplies_list = await _build_user_today_supplies(db, get_cabinet_owner_id(user))
                     if not supplies_list:
-                        empty_message = "📅 <b>Поставки на сегодня</b>\n\nНа сегодня поставок нет."
+                        empty_message = "📅 <b>Поставки на сегодня</b>\n\nНа сегодня готовых к отгрузке поставок нет."
                         await create_in_app_notification(
                             db,
                             user_id=user.id,
                             kind="today_supplies",
                             title="Поставки на сегодня",
-                            body="На сегодня поставок нет.",
+                            body="На сегодня готовых к отгрузке поставок нет.",
                             action_url="/supplies",
                             severity="info",
                             is_important=False,
@@ -1631,7 +1631,7 @@ def today_supplies_task():
                             user=user,
                             settings=settings,
                             title="Поставки на сегодня",
-                            plain_text="На сегодня поставок нет.",
+                            plain_text="На сегодня готовых к отгрузке поставок нет.",
                             action_url="/supplies",
                             kind="today_supplies",
                             severity="info",
@@ -1735,12 +1735,12 @@ def today_supplies_task():
                             web_push_count=web_push_count,
                             telegram_count=telegram_count,
                             admin_telegram_count=admin_telegram_count,
-                            details={
-                                "report_date": report_date,
-                                "has_today_supplies": False,
-                                "has_next_supplies": bool(next_supplies_list and next_report_date),
-                            },
-                        )
+                        details={
+                            "report_date": report_date,
+                            "has_today_supplies": False,
+                            "has_next_supplies": bool(next_supplies_list and next_report_date),
+                        },
+                    )
                         await _mark_notification_delivery(
                             user_id=user.id,
                             report_type="today_supplies",

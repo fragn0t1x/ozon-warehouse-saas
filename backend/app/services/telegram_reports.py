@@ -11,6 +11,8 @@ from app.models.store import Store
 from app.models.supply import Supply, SupplyItem
 from app.models.variant import Variant
 
+TODAY_REPORT_SUPPLY_STATUSES = {"READY_TO_SUPPLY"}
+
 
 async def get_products_grouped_by_variants(db: AsyncSession, supply_id: int):
     items_stmt = select(SupplyItem).where(SupplyItem.supply_id == supply_id)
@@ -97,6 +99,7 @@ async def build_user_today_supplies(
             Store.user_id == cabinet_owner_id,
             Supply.timeslot_from >= target_date,
             Supply.timeslot_from < next_day,
+            Supply.status.in_(TODAY_REPORT_SUPPLY_STATUSES),
         )
         .order_by(Supply.timeslot_from)
     )
@@ -116,6 +119,7 @@ async def build_user_next_supplies(
         .where(
             Store.user_id == cabinet_owner_id,
             Supply.timeslot_from >= from_date,
+            Supply.status.in_(TODAY_REPORT_SUPPLY_STATUSES),
         )
         .order_by(Supply.timeslot_from)
     )
