@@ -1,5 +1,6 @@
 from collections import defaultdict
 from datetime import datetime
+from html import escape
 import logging
 from urllib.parse import quote
 from typing import List, Dict, Optional
@@ -381,24 +382,32 @@ class TelegramService:
 
         today = datetime.now().strftime("%d.%m.%Y")
         text = f"📦 <b>{title or f'Поставки на {today}'}</b>\n\n"
+        supplies_count_label = (
+            "Поставок"
+            if title and "Ближайшие поставки" in title
+            else "Поставок сегодня"
+        )
 
         supplies_by_store: Dict[str, List[Dict]] = defaultdict(list)
         for supply in supplies:
             supplies_by_store[supply.get("store_name") or "Без названия"].append(supply)
 
         for store_name, store_supplies in supplies_by_store.items():
+            safe_store_name = escape(str(store_name or "Без названия"))
             total_items = sum(supply.get("total_items", 0) for supply in store_supplies)
             total_quantity = sum(supply.get("total_quantity", 0) for supply in store_supplies)
             text += (
-                f"🏪 <b>{store_name}</b>\n"
-                f"• Поставок сегодня: {len(store_supplies)}\n"
+                f"🏪 <b>{safe_store_name}</b>\n"
+                f"• {supplies_count_label}: {len(store_supplies)}\n"
                 f"• Всего позиций: {total_items}\n"
                 f"• Всего штук: {total_quantity}\n\n"
             )
 
             for supply in store_supplies:
-                text += f"🔹 <b>Заявка №{supply['order_number']}</b>\n"
-                text += f"📊 Статус: {supply['status_ru']}\n"
+                safe_order_number = escape(str(supply.get("order_number") or "—"))
+                safe_status = escape(str(supply.get("status_ru") or supply.get("status") or "—"))
+                text += f"🔹 <b>Заявка №{safe_order_number}</b>\n"
+                text += f"📊 Статус: {safe_status}\n"
 
                 if supply.get("timeslot_from") and supply.get("timeslot_to"):
                     time_from = supply["timeslot_from"].strftime("%H:%M")
@@ -412,28 +421,24 @@ class TelegramService:
                         if not variants:
                             continue
 
-                        product_name = variants[0]["product_name"]
+                        product_name = escape(str(variants[0].get("product_name") or "Без названия"))
                         text += f"\n<b>{product_name}</b>\n"
 
                         for item in variants:
                             variant = item["variant"]
                             attrs = []
-                            offer_id = str(variant.get("offer_id") or "").strip()
+                            offer_id = escape(str(variant.get("offer_id") or "").strip())
 
                             if variant.get("color"):
-                                attrs.append(f"цвет: {variant['color']}")
+                                attrs.append(f"цвет: {escape(str(variant['color']))}")
                             if variant.get("size"):
-                                attrs.append(f"размер: {variant['size']}")
+                                attrs.append(f"размер: {escape(str(variant['size']))}")
                             if variant.get("pack_size", 1) > 1:
                                 attrs.append(f"упаковка: {variant['pack_size']} шт")
 
-                            attr_text = f" ({', '.join(attrs)})" if attrs else ""
-                            offer_text = f"артикул: {offer_id}" if offer_id else None
-                            details = [offer_text] if offer_text else []
-                            if attr_text:
-                                details.append(attr_text[2:-1] if attr_text.startswith(" (") and attr_text.endswith(")") else attr_text.strip("() "))
-                            details_text = f" ({', '.join(details)})" if details else ""
-                            text += f"  •{details_text}: {variant['quantity']} шт.\n"
+                            details_text = f"({', '.join(attrs)})" if attrs else ""
+                            variant_label = offer_id or "Без артикула"
+                            text += f"  • {variant_label}{details_text} - {variant['quantity']} шт.\n"
 
                     text += (
                         f"\n<b>Итого по заявке:</b> "
