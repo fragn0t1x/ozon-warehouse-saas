@@ -222,6 +222,7 @@ async def _apply_variant_cost_batch_changes(
         for variant, warehouse_product_id in rows:
             item = item_by_variant_id[int(variant.id)]
             normalized_effective_from = item.effective_from or datetime.now(timezone.utc).date()
+            variant.unit_cost = item.unit_cost
             attributes = {attr.name: attr.value for attr in variant.attributes}
             history_variants_by_effective_from[normalized_effective_from].append((variant, warehouse_product_id, attributes))
             touched_product_ids.add(int(variant.product_id))
