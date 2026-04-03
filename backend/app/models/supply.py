@@ -28,6 +28,12 @@ class Supply(Base):
     dropoff = relationship("OzonWarehouse", foreign_keys=[dropoff_warehouse_id])
     storage = relationship("OzonWarehouse", foreign_keys=[storage_warehouse_id])
     items = relationship("SupplyItem", back_populates="supply", cascade="all, delete-orphan")
+    notification_events = relationship(
+        "SupplyNotificationEvent",
+        back_populates="supply",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 class SupplyItem(Base):
     __tablename__ = "supply_items"

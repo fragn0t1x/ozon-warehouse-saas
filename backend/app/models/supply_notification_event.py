@@ -31,7 +31,7 @@ class SupplyNotificationEvent(Base):
     attempts = Column(Integer, nullable=False, server_default="0")
     created_at = Column(DateTime(timezone=True), nullable=False, server_default=func.now(), index=True)
 
-    supply = relationship("Supply", backref="notification_events")
+    supply = relationship("Supply", back_populates="notification_events")
 
     def __repr__(self) -> str:
         return (
