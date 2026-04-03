@@ -24,6 +24,7 @@ import { dashboardAPI, normalizeDashboardSummary, type DashboardSummary } from '
 import { getSupplyStatusLabel, getSupplyStatusStyle } from '@/lib/constants/supplyStatus';
 import { useAuth } from '@/lib/context/AuthContext';
 import { useStoreContext } from '@/lib/context/StoreContext';
+import { storesAPI, type StoreSyncKindStatus } from '@/lib/api/stores';
 import { TAX_OPTIONS, VAT_OPTIONS } from '@/lib/unitEconomicsCalculator';
 
 function formatDate(value: string | null) {
@@ -140,6 +141,23 @@ function metricInfoAlign(index: number, total: number): 'start' | 'end' {
   return index < startCount ? 'start' : 'end';
 }
 
+function monthCompare(left: string | null | undefined, right: string | null | undefined) {
+  return String(left || '').localeCompare(String(right || ''), 'ru');
+}
+
+function isClosedMonthRecalculating(month: string | null | undefined, sync: StoreSyncKindStatus | null) {
+  if (!month || !sync || (sync.status !== 'queued' && sync.status !== 'running')) {
+    return false;
+  }
+
+  const startMonth = String(sync.start_month || '').trim();
+  if (startMonth) {
+    return monthCompare(String(month), startMonth) >= 0;
+  }
+
+  return Number(sync.months_requested || 0) > 0;
+}
+
 export default function DashboardPage() {
   const { isInitialized, user } = useAuth();
   const { stores, selectedStore, selectedStoreId } = useStoreContext();
@@ -148,6 +166,7 @@ export default function DashboardPage() {
   const [closedMonthDetail, setClosedMonthDetail] = useState<ClosedMonthFinanceDetail | null>(null);
   const [closedMonthDetailLoading, setClosedMonthDetailLoading] = useState(false);
   const [latestClosedMonthFromHistory, setLatestClosedMonthFromHistory] = useState<string | null>(null);
+  const [closedMonthsSync, setClosedMonthsSync] = useState<StoreSyncKindStatus | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
   const selectedClosedMonthPeriod =
@@ -234,6 +253,45 @@ export default function DashboardPage() {
       cancelled = true;
     };
   }, [selectedStoreId]);
+
+  const loadClosedMonthsSyncStatus = useCallback(async (force = false) => {
+    if (!selectedStoreId) {
+      setClosedMonthsSync(null);
+      return null;
+    }
+    try {
+      const status = await storesAPI.getSyncStatus(selectedStoreId, { force });
+      const next = (status.sync_kinds?.closed_months as StoreSyncKindStatus | undefined) ?? null;
+      setClosedMonthsSync(next);
+      return next;
+    } catch {
+      return null;
+    }
+  }, [selectedStoreId]);
+
+  useEffect(() => {
+    void loadClosedMonthsSyncStatus(true);
+  }, [loadClosedMonthsSyncStatus]);
+
+  useEffect(() => {
+    if (!selectedStoreId) {
+      return;
+    }
+    const isActive = closedMonthsSync?.status === 'queued' || closedMonthsSync?.status === 'running';
+    if (!isActive) {
+      return;
+    }
+    const timer = window.setInterval(() => {
+      void loadClosedMonthsSyncStatus(true);
+    }, 3000);
+    return () => window.clearInterval(timer);
+  }, [closedMonthsSync?.status, loadClosedMonthsSyncStatus, selectedStoreId]);
+
+  useEffect(() => {
+    if (closedMonthsSync?.status === 'success') {
+      void loadSummary();
+    }
+  }, [closedMonthsSync?.finished_at, closedMonthsSync?.status, loadSummary]);
 
   useEffect(() => {
     let cancelled = false;
@@ -371,6 +429,9 @@ export default function DashboardPage() {
   const closedMonthTaxAmount = closedMonthSummary?.tax_amount ?? unitEconomicsSummary.tax_amount;
   const closedMonthNetProfit = closedMonthSummary?.net_profit ?? (closedMonthProfitBeforeTax - closedMonthTaxAmount);
   const hasFullCostCoverage = closedMonthCoverageRatio >= 0.9999;
+  const closedMonthCostRecalculating =
+    !hasFullCostCoverage &&
+    isClosedMonthRecalculating(closedMonthSummary?.month ?? selectedClosedMonthPeriod, closedMonthsSync);
   const revenueExplanation = `${formatCurrency(closedMonthSoldAmount)} - ${formatCurrency(closedMonthReturnedAmount)} = ${formatCurrency(closedMonthRevenueAmount)}`;
   const grossProfitExplanation = `${formatCurrency(closedMonthRevenueNetOfVat)} - ${formatCurrency(closedMonthCogs)} = ${formatCurrency(closedMonthGrossProfit)}`;
   const commissionExplanation = `${formatCurrency(realization.sold_fee)} - ${formatCurrency(realization.returned_fee)} = ${formatCurrency(closedMonthOzonCommission)}`;
@@ -884,18 +945,26 @@ export default function DashboardPage() {
                     </Link>
                     <div
                       className={`inline-flex items-center rounded-full px-3 py-1 text-xs font-medium ${
-                        hasFullCostCoverage
+                        closedMonthCostRecalculating
+                          ? 'bg-sky-50 text-sky-700'
+                          : hasFullCostCoverage
                           ? 'bg-emerald-50 text-emerald-700'
                           : 'bg-amber-50 text-amber-800'
                       }`}
                     >
-                      {hasFullCostCoverage
+                      {closedMonthCostRecalculating
+                          ? 'Себестоимость сохранена, идет перерасчет'
+                          : hasFullCostCoverage
                           ? 'Покрытие себестоимости 100%'
                           : `Покрытие себестоимости ${formatPercent(closedMonthCoverageRatio)}`}
                     </div>
                   </div>
                 </div>
-                {!hasFullCostCoverage ? (
+                {closedMonthCostRecalculating ? (
+                  <div className="mt-3 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+                    Себестоимость сохранена. Сейчас пересчитываем закрытый месяц и скоро обновим прибыль.
+                  </div>
+                ) : !hasFullCostCoverage ? (
                   <div className="mt-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
                     Пока не показываем прибыль, потому что себестоимость заполнена не полностью.
                     Сейчас заполнено: {formatPercent(closedMonthCoverageRatio)}.
@@ -1035,6 +1104,10 @@ export default function DashboardPage() {
                 </div>
               </article>
             </div>
+            ) : closedMonthCostRecalculating ? (
+              <div className="mt-5 rounded-3xl border border-sky-200 bg-sky-50 px-5 py-6 text-sm text-sky-700">
+                Себестоимость по закрытому месяцу уже сохранена. Как только перерасчет завершится, здесь автоматически появятся прибыльные и убыточные артикулы.
+              </div>
             ) : (
               <div className="mt-5 rounded-3xl border border-slate-200 bg-white px-5 py-6 text-sm text-slate-600">
                 Пока себестоимость закрыта не полностью, не показываем блоки с выгодными и убыточными артикулами.

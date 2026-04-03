@@ -1738,7 +1738,11 @@ export default function ClosedMonthsPage() {
                         : '—'}
                     </div>
 
-                    {!selectedMonthHasFullCoverage ? (
+                    {selectedMonthCostRecalculating ? (
+                      <div className="mt-4 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-3 text-sm text-sky-900">
+                        Себестоимость сохранена. Сейчас пересчитываем закрытый месяц и скоро обновим прибыль.
+                      </div>
+                    ) : !selectedMonthHasFullCoverage ? (
                       <div className="mt-4 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-950">
                         В этом месяце себестоимость заполнена не по всему ассортименту, поэтому прибыль пока скрыта.
                         <Link href="/cost-history" className="ml-1 font-medium underline decoration-dotted underline-offset-2">
@@ -1747,7 +1751,7 @@ export default function ClosedMonthsPage() {
                       </div>
                     ) : null}
 
-                    {missingCostOffers.length > 0 ? (
+                    {!selectedMonthCostRecalculating && missingCostOffers.length > 0 ? (
                       <div className="mt-4 rounded-3xl border border-amber-200 bg-amber-50/70 p-4">
                         <div className="flex flex-wrap items-start justify-between gap-3">
                           <div>
