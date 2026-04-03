@@ -119,6 +119,7 @@ function monthLabel(month: string) {
 
 function statusLabel(status: string) {
   if (status === 'ready') return 'Готов';
+  if (status === 'recalculating') return 'Идет перерасчет';
   if (status === 'needs_cost') return 'Нужна себестоимость';
   if (status === 'ozon_warning') return 'Ограничения Ozon';
   if (status === 'partial') return 'Требует внимания';
@@ -130,6 +131,7 @@ function statusLabel(status: string) {
 
 function statusClass(status: string) {
   if (status === 'ready') return 'bg-emerald-50 text-emerald-700';
+  if (status === 'recalculating') return 'bg-sky-50 text-sky-700';
   if (status === 'needs_cost') return 'bg-amber-50 text-amber-800';
   if (status === 'ozon_warning') return 'bg-sky-50 text-sky-700';
   if (status === 'partial') return 'bg-amber-50 text-amber-800';
@@ -180,6 +182,45 @@ function effectiveMonthStatus(item: ClosedMonthFinance | null | undefined) {
   const warnings = monthWarningsSummary(item);
   if (warnings.critical.length > 0) return 'ozon_warning';
   return 'ready';
+}
+
+function monthCompare(left: string | null | undefined, right: string | null | undefined) {
+  return String(left || '').localeCompare(String(right || ''), 'ru');
+}
+
+function isMonthCoveredByActiveSync(
+  month: string | null | undefined,
+  months: ClosedMonthFinance[],
+  sync: StoreSyncKindStatus | null,
+) {
+  if (!month || !sync || (sync.status !== 'queued' && sync.status !== 'running')) {
+    return false;
+  }
+
+  const startMonth = String(sync.start_month || '').trim();
+  if (startMonth) {
+    return monthCompare(String(month), startMonth) >= 0;
+  }
+
+  const monthsRequested = Number(sync.months_requested || 0);
+  if (monthsRequested <= 0) {
+    return false;
+  }
+
+  const index = months.findIndex((item) => item.month === month);
+  return index >= 0 && index < monthsRequested;
+}
+
+function visibleMonthStatus(
+  item: ClosedMonthFinance | null | undefined,
+  months: ClosedMonthFinance[],
+  sync: StoreSyncKindStatus | null,
+) {
+  const baseStatus = effectiveMonthStatus(item);
+  if (baseStatus === 'needs_cost' && isMonthCoveredByActiveSync(item?.month, months, sync)) {
+    return 'recalculating';
+  }
+  return baseStatus;
 }
 
 function hasCriticalOzonWarnings(item: ClosedMonthFinance | null | undefined) {
@@ -931,6 +972,8 @@ export default function ClosedMonthsPage() {
   const closedMonthsSyncMonthsCompleted = Number(closedMonthsSync?.months_completed ?? 0);
   const closedMonthsSyncMessage = humanizeClosedMonthsMessage(closedMonthsSync?.message);
   const selectedMonthErrorReason = closedMonthErrorReason(selectedMonthSummary);
+  const selectedMonthVisibleStatus = visibleMonthStatus(selectedMonthSummary, months, closedMonthsSync);
+  const selectedMonthCostRecalculating = selectedMonthVisibleStatus === 'recalculating';
   const previousMonthOffersByOfferId = useMemo(
     () => new Map(previousMonthOffers.map((item) => [item.offer_id, item])),
     [previousMonthOffers]
@@ -1299,8 +1342,10 @@ export default function ClosedMonthsPage() {
                 </div>
                 {closedMonthsSyncMonthsRequested > 0 ? (
                   <div className="mt-3 text-xs text-slate-500">
-                    {closedMonthsSyncMonthsRequested <= 3
-                      ? 'Быстрая загрузка: подтягиваем последние 3 закрытых месяца магазина.'
+                    {closedMonthsSyncMonthsRequested === 1
+                      ? `Точечный пересчет: обновляем ${monthLabel(String(closedMonthsSync.start_month || closedMonthsSync.current_month || ''))}.`
+                      : closedMonthsSyncMonthsRequested <= 3
+                      ? `Быстрая загрузка: подтягиваем последние ${closedMonthsSyncMonthsRequested} закрытых ${closedMonthsSyncMonthsRequested === 2 ? 'месяца' : 'месяца'} магазина.`
                       : closedMonthsSyncMonthsRequested <= 6
                         ? 'Расширенная загрузка: подтягиваем последние 6 закрытых месяцев магазина.'
                         : closedMonthsSyncMonthsRequested <= 12
@@ -1493,9 +1538,10 @@ export default function ClosedMonthsPage() {
                     const previousMonth = currentIndex >= 0 ? months[currentIndex + 1] ?? null : null;
                     const monthHasFullCoverage = Number(item.coverage_ratio || 0) >= 0.9999;
                     const previousMonthHasFullCoverage = previousMonth ? Number(previousMonth.coverage_ratio || 0) >= 0.9999 : false;
-                    const displayStatus = effectiveMonthStatus(item);
+                    const displayStatus = visibleMonthStatus(item, months, closedMonthsSync);
                     const visibleStatus =
                       !canSeeTechnicalWarnings && displayStatus === 'ozon_warning' ? 'ready' : displayStatus;
+                    const monthCostRecalculating = visibleStatus === 'recalculating';
                     const hasOzonWarnings = canSeeTechnicalWarnings && hasCriticalOzonWarnings(item);
                     const soldDelta = previousMonth ? Number(item.sold_units || 0) - Number(previousMonth.sold_units || 0) : 0;
                     const revenueDelta = previousMonth ? Number(item.revenue_amount || 0) - Number(previousMonth.revenue_amount || 0) : 0;
@@ -1551,6 +1597,11 @@ export default function ClosedMonthsPage() {
                                   <div className="mt-1 text-xs text-slate-400">Нет более раннего полного месяца для сравнения</div>
                                 )}
                               </>
+                            ) : monthCostRecalculating ? (
+                              <>
+                                <div className="mt-1 text-lg font-semibold text-sky-600">Пересчитываем</div>
+                                <div className="mt-1 text-xs text-sky-700">Себестоимость уже сохранена, ждем обновление месяца</div>
+                              </>
                             ) : (
                               <>
                                 <div className="mt-1 text-lg font-semibold text-slate-400">Скрыто</div>
@@ -1568,8 +1619,10 @@ export default function ClosedMonthsPage() {
                               {formatDelta(soldDelta, 'units')}
                             </span>
                           ) : null}
-                          <span className="rounded-full bg-slate-100 px-3 py-1 text-slate-600">
-                            Себестоимость заполнена: {formatPercent(item.coverage_ratio)}
+                          <span className={`rounded-full px-3 py-1 ${monthCostRecalculating ? 'bg-sky-50 text-sky-700' : 'bg-slate-100 text-slate-600'}`}>
+                            {monthCostRecalculating
+                              ? 'Себестоимость сохранена, идет перерасчет'
+                              : `Себестоимость заполнена: ${formatPercent(item.coverage_ratio)}`}
                           </span>
                           {hasOzonWarnings ? (
                             <span className="rounded-full bg-sky-50 px-3 py-1 text-sky-700">
@@ -1596,7 +1649,7 @@ export default function ClosedMonthsPage() {
                 ) : (
                   <>
                     {(() => {
-                      const selectedMonthDisplayStatus = effectiveMonthStatus(selectedMonthSummary);
+                      const selectedMonthDisplayStatus = selectedMonthVisibleStatus;
                       const visibleSelectedMonthStatus =
                         !canSeeTechnicalWarnings && selectedMonthDisplayStatus === 'ozon_warning'
                           ? 'ready'
@@ -1639,11 +1692,15 @@ export default function ClosedMonthsPage() {
                           {statusLabel(visibleSelectedMonthStatus)}
                         </span>
                         <span className={`rounded-full px-3 py-1 text-xs font-medium ${
-                          selectedMonthSummary.coverage_ratio >= 0.9999
+                          selectedMonthCostRecalculating
+                            ? 'bg-sky-50 text-sky-700'
+                            : selectedMonthSummary.coverage_ratio >= 0.9999
                             ? 'bg-emerald-50 text-emerald-700'
                             : 'bg-amber-50 text-amber-800'
                         }`}>
-                          Покрытие себестоимости {formatPercent(selectedMonthSummary.coverage_ratio)}
+                          {selectedMonthCostRecalculating
+                            ? 'Себестоимость сохранена, идет перерасчет'
+                            : `Покрытие себестоимости ${formatPercent(selectedMonthSummary.coverage_ratio)}`}
                         </span>
                       </div>
                     </div>
