@@ -1,4 +1,3 @@
-# backend/app/api/products_router.py
 from datetime import date, datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field, model_validator
@@ -157,6 +156,7 @@ async def _apply_variant_cost_batch_updates(
     history_variants_by_effective_from: dict[date, list[tuple[Variant, int | None, dict[str, str]]]] = defaultdict(list)
     touched_store_effective_from: dict[int, date] = {}
     touched_product_ids: set[int] = set()
+    touched_variant_ids: set[int] = set()
     variants_by_id: dict[int, Variant] = {}
 
     for variant, warehouse_product_id in rows:
@@ -166,6 +166,7 @@ async def _apply_variant_cost_batch_updates(
         attributes = {attr.name: attr.value for attr in variant.attributes}
         history_variants_by_effective_from[normalized_effective_from].append((variant, warehouse_product_id, attributes))
         touched_product_ids.add(int(variant.product_id))
+        touched_variant_ids.add(int(variant.id))
         variants_by_id[int(variant.id)] = variant
 
         store_id = int(variant.product.store_id)
