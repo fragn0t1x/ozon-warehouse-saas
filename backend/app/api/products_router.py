@@ -49,6 +49,25 @@ async def _earliest_store_month_needing_cost(db: AsyncSession, store_id: int) ->
     return date(int(year_str), int(month_str), 1)
 
 
+async def _earliest_store_closed_month_with_realization(db: AsyncSession, store_id: int) -> date | None:
+    from app.models.store_month_finance import StoreMonthFinance
+
+    result = await db.execute(
+        select(StoreMonthFinance.month)
+        .where(
+            StoreMonthFinance.store_id == store_id,
+            StoreMonthFinance.realization_available.is_(True),
+        )
+        .order_by(StoreMonthFinance.month.asc())
+        .limit(1)
+    )
+    month = result.scalar_one_or_none()
+    if not month:
+        return None
+    year_str, month_str = str(month).split("-", 1)
+    return date(int(year_str), int(month_str), 1)
+
+
 class VariantCostUpdate(BaseModel):
     unit_cost: float | None = Field(default=None, ge=0)
     effective_from: date | None = None
@@ -161,10 +180,32 @@ async def _apply_variant_cost_batch_updates(
             created_by_user_id=current_user.id,
         )
 
+    history_count_by_variant: dict[int, int] = {}
+    for variant_id in touched_variant_ids:
+        history_count = (
+            await db.execute(
+                select(VariantCostHistory.id)
+                .where(VariantCostHistory.variant_id == variant_id)
+            )
+        ).scalars().all()
+        history_count_by_variant[variant_id] = len(history_count)
+
     recalc_from_by_store: dict[int, date] = {}
     for store_id, effective_from in touched_store_effective_from.items():
-        earliest_needs_cost_month = await _earliest_store_month_needing_cost(db, store_id)
-        recalc_from = min(effective_from, earliest_needs_cost_month) if earliest_needs_cost_month else effective_from
+        store_variant_ids = [
+            variant_id
+            for variant_id, variant in variants_by_id.items()
+            if variant.product is not None and int(variant.product.store_id) == store_id
+        ]
+        has_first_cost_entry = any(history_count_by_variant.get(variant_id) == 1 for variant_id in store_variant_ids)
+
+        if has_first_cost_entry:
+            earliest_closed_month = await _earliest_store_closed_month_with_realization(db, store_id)
+            recalc_from = earliest_closed_month or effective_from
+        else:
+            earliest_needs_cost_month = await _earliest_store_month_needing_cost(db, store_id)
+            recalc_from = min(effective_from, earliest_needs_cost_month) if earliest_needs_cost_month else effective_from
+
         recalc_from_by_store[store_id] = recalc_from
         await economics_service.unlock_store_months_from_date(
             store_id=store_id,
