@@ -30,10 +30,12 @@ from app.services.bootstrap_sync import (
     reset_bootstrap_state_sync,
 )
 from app.services.cabinet_access import get_cabinet_owner_id
+from app.services.closed_month_history_service import ClosedMonthHistoryService
+from app.services.closed_months_recalc_queue import ClosedMonthsRecalcQueue
 from app.services.economics_history_service import EconomicsHistoryService
+from app.services.export_status import mark_store_exports_stale
 from app.services.settings_service import SettingsService
 from app.services.store_linking_service import StoreLinkingService
-from app.services.sync_dispatcher import enqueue_closed_month_history_sync
 from app.services.sync_dispatcher import enqueue_full_sync
 from app.services.sync_scheduler import StoreSyncScheduler
 from app.services.sync_service import SyncService
@@ -143,16 +145,37 @@ def _log_deleted_rows(message: str, rowcount: int | None, store_id: int, *args) 
     logger.info(message, rowcount or 0, *args, store_id)
 
 
-def _closed_months_backfill_window(effective_from: datetime | None = None, *, effective_date=None) -> int:
-    value = effective_date or (effective_from.date() if effective_from else None) or datetime.now(timezone.utc).date()
-    today = datetime.now(timezone.utc).date()
-    months = (today.year - value.year) * 12 + (today.month - value.month) + 1
-    return max(1, min(int(months), 36))
-
-
 def _closed_months_start_month(effective_from: datetime | None = None, *, effective_date=None) -> str:
     value = effective_date or (effective_from.date() if effective_from else None) or datetime.now(timezone.utc).date()
     return f"{value.year:04d}-{value.month:02d}"
+
+
+def _is_month_after_latest_closed(effective_date) -> bool:
+    value = effective_date or datetime.now(timezone.utc).date()
+    latest_closed_month = ClosedMonthHistoryService._latest_closed_month()
+    return _closed_months_start_month(effective_date=value) > latest_closed_month
+
+
+def _closed_months_export_stale_message() -> str:
+    return "Налоговая схема изменилась. Excel по закрытым месяцам устарел, сформируй его заново."
+
+
+async def _queue_closed_months_recalc_after_store_economics_change(store_id: int, *, effective_date) -> dict:
+    if _is_month_after_latest_closed(effective_date):
+        return {
+            "status": "skipped_future",
+            "store_id": store_id,
+            "start_month": _closed_months_start_month(effective_date=effective_date),
+        }
+    mark_store_exports_stale(
+        "closed_months",
+        store_id,
+        message=_closed_months_export_stale_message(),
+    )
+    return await ClosedMonthsRecalcQueue().queue(
+        store_id,
+        start_month=_closed_months_start_month(effective_date=effective_date),
+    )
 
 
 async def _cleanup_supply_related_rows(db: AsyncSession, store_id: int) -> None:
@@ -354,6 +377,9 @@ async def create_store(
         client_id=store_data.client_id,
         api_key_encrypted=encrypted_key,
         is_active=True,
+        economics_vat_mode=store_data.economics_vat_mode,
+        economics_tax_mode=store_data.economics_tax_mode,
+        economics_tax_rate=float(store_data.economics_tax_rate),
     )
 
     db.add(store)
@@ -365,6 +391,7 @@ async def create_store(
         effective_from=store.created_at.date() if store.created_at else None,
         created_by_user_id=current_user.id,
     )
+    await EconomicsHistoryService(db).sync_store_current_economics_from_history(store=store)
     await db.commit()
 
     settings_service = SettingsService(db)
@@ -433,8 +460,15 @@ async def create_store(
             detail="Не удалось подготовить товары нового магазина",
         )
 
-    economics_effective_from = await _get_store_economics_effective_from(db, store.id)
-    return _serialize_store(store, warehouse_id, economics_effective_from)
+    current_snapshot = await _get_current_store_economics_snapshot(db, store)
+    return _serialize_store(
+        store,
+        warehouse_id,
+        current_snapshot.effective_from,
+        economics_vat_mode=current_snapshot.vat_mode,
+        economics_tax_mode=current_snapshot.tax_mode,
+        economics_tax_rate=current_snapshot.tax_rate,
+    )
 
 
 @router.get("", response_model=List[StoreResponse])
@@ -552,29 +586,25 @@ async def delete_store_economics_history(
     await db.delete(target)
     await db.flush()
 
-    latest = (
+    remaining = (
         await db.execute(
-            select(StoreEconomicsHistory)
+            select(StoreEconomicsHistory.id)
             .where(StoreEconomicsHistory.store_id == store.id)
-            .order_by(StoreEconomicsHistory.effective_from.desc(), StoreEconomicsHistory.id.desc())
             .limit(1)
         )
-    ).scalars().first()
-    if latest is None:
+    ).scalar_one_or_none()
+    if remaining is None:
         raise HTTPException(status_code=400, detail="После удаления не осталось налоговой схемы")
 
-    store.economics_vat_mode = latest.vat_mode
-    store.economics_tax_mode = latest.tax_mode
-    store.economics_tax_rate = float(latest.tax_rate or 0)
+    await EconomicsHistoryService(db).sync_store_current_economics_from_history(store=store)
     await EconomicsHistoryService(db).unlock_store_months_from_date(
         store_id=store.id,
         effective_from=target.effective_from,
     )
     await db.commit()
-
-    enqueue_closed_month_history_sync(
+    await _queue_closed_months_recalc_after_store_economics_change(
         store.id,
-        months_back=_closed_months_backfill_window(effective_date=target.effective_from),
+        effective_date=target.effective_from,
     )
     return {"status": "success", "message": "Запись истории удалена"}
 
@@ -609,6 +639,7 @@ async def update_store(
         effective_from=effective_from,
         created_by_user_id=current_user.id,
     )
+    current_snapshot = await EconomicsHistoryService(db).sync_store_current_economics_from_history(store=store)
     await EconomicsHistoryService(db).unlock_store_months_from_date(
         store_id=store.id,
         effective_from=effective_from or datetime.now(timezone.utc).date(),
@@ -617,15 +648,20 @@ async def update_store(
     await db.commit()
     await db.refresh(store)
 
-    enqueue_closed_month_history_sync(
+    await _queue_closed_months_recalc_after_store_economics_change(
         store.id,
-        months_back=_closed_months_backfill_window(effective_date=effective_from),
-        start_month=_closed_months_start_month(effective_date=effective_from),
+        effective_date=effective_from,
     )
 
     warehouse_id = await _get_store_warehouse_id(db, store.id)
-    economics_effective_from = await _get_store_economics_effective_from(db, store.id)
-    return _serialize_store(store, warehouse_id, economics_effective_from)
+    return _serialize_store(
+        store,
+        warehouse_id,
+        current_snapshot.effective_from,
+        economics_vat_mode=current_snapshot.vat_mode,
+        economics_tax_mode=current_snapshot.tax_mode,
+        economics_tax_rate=current_snapshot.tax_rate,
+    )
 
 
 @router.patch("/{store_id}", response_model=StoreResponse)
@@ -675,10 +711,13 @@ async def patch_store(
             effective_from=effective_from,
             created_by_user_id=current_user.id,
         )
+        current_snapshot = await EconomicsHistoryService(db).sync_store_current_economics_from_history(store=store)
         await EconomicsHistoryService(db).unlock_store_months_from_date(
             store_id=store.id,
             effective_from=effective_from or datetime.now(timezone.utc).date(),
         )
+    else:
+        current_snapshot = await _get_current_store_economics_snapshot(db, store)
 
     await db.commit()
     await db.refresh(store)
@@ -689,15 +728,20 @@ async def patch_store(
         or "economics_tax_rate" in payload
         or "economics_effective_from" in payload
     ):
-        enqueue_closed_month_history_sync(
+        await _queue_closed_months_recalc_after_store_economics_change(
             store.id,
-            months_back=_closed_months_backfill_window(effective_date=payload.get("economics_effective_from")),
-            start_month=_closed_months_start_month(effective_date=payload.get("economics_effective_from")),
+            effective_date=payload.get("economics_effective_from"),
         )
 
     warehouse_id = await _get_store_warehouse_id(db, store.id)
-    economics_effective_from = await _get_store_economics_effective_from(db, store.id)
-    return _serialize_store(store, warehouse_id, economics_effective_from)
+    return _serialize_store(
+        store,
+        warehouse_id,
+        current_snapshot.effective_from,
+        economics_vat_mode=current_snapshot.vat_mode,
+        economics_tax_mode=current_snapshot.tax_mode,
+        economics_tax_rate=current_snapshot.tax_rate,
+    )
 
 
 @router.delete("/{store_id}")

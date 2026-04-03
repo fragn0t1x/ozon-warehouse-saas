@@ -30,6 +30,13 @@ import {
 } from '@/lib/api/stores';
 import { useAuth } from '@/lib/context/AuthContext';
 import { useStoreContext } from '@/lib/context/StoreContext';
+import {
+  getTaxRatePreset,
+  TAX_OPTIONS,
+  VAT_OPTIONS,
+  type TaxMode,
+  type VatMode,
+} from '@/lib/unitEconomicsCalculator';
 
 const STEPS = [
   { id: 1, title: 'Как хранить товары' },
@@ -101,6 +108,9 @@ type FormState = {
   store_name: string;
   client_id: string;
   api_key: string;
+  economics_vat_mode: VatMode;
+  economics_tax_mode: TaxMode;
+  economics_tax_rate: number;
 };
 
 const DEFAULT_FORM: FormState = {
@@ -121,6 +131,9 @@ const DEFAULT_FORM: FormState = {
   store_name: '',
   client_id: '',
   api_key: '',
+  economics_vat_mode: 'none',
+  economics_tax_mode: 'usn_income_expenses',
+  economics_tax_rate: 15,
 };
 
 function cn(...classes: Array<string | false | null | undefined>) {
@@ -770,6 +783,9 @@ export default function WelcomePage() {
         name: form.store_name.trim(),
         client_id: form.client_id.trim(),
         api_key: form.api_key.trim(),
+        economics_vat_mode: form.economics_vat_mode,
+        economics_tax_mode: form.economics_tax_mode,
+        economics_tax_rate: form.economics_tax_rate,
         product_links: productLinks,
       });
 
@@ -1055,6 +1071,68 @@ export default function WelcomePage() {
                         onChange={(event) => update('api_key', event.target.value)}
                         className="mt-2 block w-full rounded-2xl border border-slate-300 px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
                       />
+                    </div>
+
+                    <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+                      <div className="text-sm font-semibold text-slate-900">Текущий налоговый режим магазина</div>
+                      <p className="mt-1 text-xs leading-5 text-slate-500">
+                        Сохраним его сразу при подключении, чтобы закрытые месяцы и юнит-экономика считались в правильной налоговой модели с первого дня.
+                      </p>
+
+                      <div className="mt-4 grid gap-4 md:grid-cols-3">
+                        <div>
+                          <label className="block text-sm font-medium text-slate-700">Режим НДС</label>
+                          <select
+                            value={form.economics_vat_mode}
+                            onChange={(event) => update('economics_vat_mode', event.target.value as VatMode)}
+                            className="mt-2 block w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+                          >
+                            {VAT_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                          <p className="mt-2 text-xs leading-5 text-slate-500">
+                            {VAT_OPTIONS.find((item) => item.value === form.economics_vat_mode)?.note}
+                          </p>
+                        </div>
+
+                        <div>
+                          <label className="block text-sm font-medium text-slate-700">Налоговая модель</label>
+                          <select
+                            value={form.economics_tax_mode}
+                            onChange={(event) => {
+                              const nextMode = event.target.value as TaxMode;
+                              update('economics_tax_mode', nextMode);
+                              update('economics_tax_rate', getTaxRatePreset(nextMode));
+                            }}
+                            className="mt-2 block w-full rounded-2xl border border-slate-300 bg-white px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+                          >
+                            {TAX_OPTIONS.map((option) => (
+                              <option key={option.value} value={option.value}>
+                                {option.label}
+                              </option>
+                            ))}
+                          </select>
+                          <p className="mt-2 text-xs leading-5 text-slate-500">
+                            {TAX_OPTIONS.find((item) => item.value === form.economics_tax_mode)?.note}
+                          </p>
+                        </div>
+
+                        <div>
+                          <label className="block text-sm font-medium text-slate-700">Ставка налога, %</label>
+                          <input
+                            type="number"
+                            min="0"
+                            max="100"
+                            step="0.1"
+                            value={form.economics_tax_rate}
+                            onChange={(event) => update('economics_tax_rate', Number(event.target.value) || 0)}
+                            className="mt-2 block w-full rounded-2xl border border-slate-300 px-4 py-3 text-sm text-slate-900 outline-none transition focus:border-sky-500 focus:ring-2 focus:ring-sky-100"
+                          />
+                        </div>
+                      </div>
                     </div>
 
                     {validationResult && (

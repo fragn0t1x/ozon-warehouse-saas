@@ -11,6 +11,9 @@ class StoreBase(BaseModel):
 
 class StoreCreate(StoreBase):
     api_key: str = Field(..., min_length=1, description="API ключ OZON")
+    economics_vat_mode: StoreEconomicsVatMode = "none"
+    economics_tax_mode: StoreEconomicsTaxMode = "usn_income_expenses"
+    economics_tax_rate: float = Field(default=15.0, ge=0, le=100)
     product_links: list["StoreProductLinkDecision"] = Field(default_factory=list)
 
 class StoreValidate(StoreCreate):

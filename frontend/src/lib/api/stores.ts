@@ -20,6 +20,9 @@ export interface StoreCreate {
   name: string;
   client_id: string;
   api_key: string;
+  economics_vat_mode: Store['economics_vat_mode'];
+  economics_tax_mode: Store['economics_tax_mode'];
+  economics_tax_rate: number;
   user_id?: number;
   product_links?: StoreProductLinkDecision[];
 }

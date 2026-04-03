@@ -70,26 +70,22 @@ class EconomicsHistoryService:
         created_by_user_id: int | None = None,
     ) -> StoreEconomicsHistory:
         normalized_effective_from = self._normalize_effective_from(effective_from or store.created_at or None)
-        latest_stmt = (
+        exact_stmt = (
             select(StoreEconomicsHistory)
-            .where(StoreEconomicsHistory.store_id == store.id)
-            .order_by(StoreEconomicsHistory.effective_from.desc(), StoreEconomicsHistory.id.desc())
+            .where(
+                StoreEconomicsHistory.store_id == store.id,
+                StoreEconomicsHistory.effective_from == normalized_effective_from,
+            )
+            .order_by(StoreEconomicsHistory.id.desc())
         )
-        latest = (await self.db.execute(latest_stmt)).scalars().first()
-        if latest and latest.effective_from == normalized_effective_from:
-            latest.vat_mode = str(store.economics_vat_mode or "none")
-            latest.tax_mode = str(store.economics_tax_mode or "usn_income_expenses")
-            latest.tax_rate = float(store.economics_tax_rate or 15.0)
+        exact = (await self.db.execute(exact_stmt)).scalars().first()
+        if exact is not None:
+            exact.vat_mode = str(store.economics_vat_mode or "none")
+            exact.tax_mode = str(store.economics_tax_mode or "usn_income_expenses")
+            exact.tax_rate = float(store.economics_tax_rate or 15.0)
             if created_by_user_id is not None:
-                latest.created_by_user_id = created_by_user_id
-            return latest
-        if latest and (
-            latest.vat_mode == str(store.economics_vat_mode or "none")
-            and latest.tax_mode == str(store.economics_tax_mode or "usn_income_expenses")
-            and float(latest.tax_rate or 0) == float(store.economics_tax_rate or 15.0)
-            and latest.effective_from == normalized_effective_from
-        ):
-            return latest
+                exact.created_by_user_id = created_by_user_id
+            return exact
 
         item = StoreEconomicsHistory(
             store_id=store.id,
@@ -159,25 +155,26 @@ class EconomicsHistoryService:
     ) -> None:
         normalized_effective_from = self._normalize_effective_from(effective_from)
         for variant, warehouse_product_id, attributes in variants:
-            latest_stmt = (
-                select(VariantCostHistory)
-                .where(VariantCostHistory.variant_id == variant.id)
-                .order_by(VariantCostHistory.effective_from.desc(), VariantCostHistory.id.desc())
-            )
-            latest = (await self.db.execute(latest_stmt)).scalars().first()
             current_value = float(variant.unit_cost) if variant.unit_cost is not None else None
-            if latest and latest.effective_from == normalized_effective_from:
-                latest.unit_cost = current_value
-                latest.offer_id = str(variant.offer_id or "")
-                latest.store_id = int(variant.product.store_id)
-                latest.warehouse_product_id = int(warehouse_product_id) if warehouse_product_id is not None else None
-                latest.pack_size = int(variant.pack_size or 1)
-                latest.color = normalize_color(attributes.get("Цвет", "без цвета")).strip().lower() or None
-                latest.size = str(attributes.get("Размер", "")).strip().lower() or None
+            exact_stmt = (
+                select(VariantCostHistory)
+                .where(
+                    VariantCostHistory.variant_id == variant.id,
+                    VariantCostHistory.effective_from == normalized_effective_from,
+                )
+                .order_by(VariantCostHistory.id.desc())
+            )
+            exact = (await self.db.execute(exact_stmt)).scalars().first()
+            if exact is not None:
+                exact.unit_cost = current_value
+                exact.offer_id = str(variant.offer_id or "")
+                exact.store_id = int(variant.product.store_id)
+                exact.warehouse_product_id = int(warehouse_product_id) if warehouse_product_id is not None else None
+                exact.pack_size = int(variant.pack_size or 1)
+                exact.color = normalize_color(attributes.get("Цвет", "без цвета")).strip().lower() or None
+                exact.size = str(attributes.get("Размер", "")).strip().lower() or None
                 if created_by_user_id is not None:
-                    latest.created_by_user_id = created_by_user_id
-                continue
-            if latest and latest.unit_cost == current_value and latest.effective_from == normalized_effective_from:
+                    exact.created_by_user_id = created_by_user_id
                 continue
 
             item = VariantCostHistory(

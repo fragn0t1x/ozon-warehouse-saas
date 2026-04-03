@@ -13,11 +13,21 @@ import {
   type StoreProductLinkDecision,
   type ValidationResult,
 } from '@/lib/api/stores';
+import {
+  getTaxRatePreset,
+  TAX_OPTIONS,
+  VAT_OPTIONS,
+  type TaxMode,
+  type VatMode,
+} from '@/lib/unitEconomicsCalculator';
 
 interface StoreFormValues {
   name: string;
   client_id: string;
   api_key: string;
+  economics_vat_mode: VatMode;
+  economics_tax_mode: TaxMode;
+  economics_tax_rate: number;
 }
 
 interface StoreFormProps {
@@ -105,12 +115,17 @@ export function StoreForm({ store, onClose, onSuccess }: StoreFormProps) {
       name: store?.name || '',
       client_id: store?.client_id || '',
       api_key: '',
+      economics_vat_mode: store?.economics_vat_mode || 'none',
+      economics_tax_mode: store?.economics_tax_mode || 'usn_income_expenses',
+      economics_tax_rate: store?.economics_tax_rate ?? 15,
     }
   });
 
   const clientId = watch('client_id');
   const apiKey = watch('api_key');
   const storeName = watch('name');
+  const economicsVatMode = watch('economics_vat_mode');
+  const economicsTaxMode = watch('economics_tax_mode');
   const currentSignature = `${storeName.trim()}|${clientId.trim()}|${apiKey.trim()}`;
 
   useEffect(() => {
@@ -118,6 +133,15 @@ export function StoreForm({ store, onClose, onSuccess }: StoreFormProps) {
       setValue('client_id', store.client_id);
     }
   }, [store, setValue]);
+
+  useEffect(() => {
+    if (!store) {
+      return;
+    }
+    setValue('economics_vat_mode', store.economics_vat_mode);
+    setValue('economics_tax_mode', store.economics_tax_mode);
+    setValue('economics_tax_rate', store.economics_tax_rate);
+  }, [setValue, store]);
 
   useEffect(() => {
     if (!validatedSignature || store) {
@@ -300,9 +324,14 @@ export function StoreForm({ store, onClose, onSuccess }: StoreFormProps) {
     setIsSubmitting(true);
     try {
       if (store) {
-        const payload = data.api_key.trim()
-          ? data
-          : { name: data.name, client_id: data.client_id };
+        const payload = {
+          name: data.name,
+          client_id: data.client_id,
+          economics_vat_mode: data.economics_vat_mode,
+          economics_tax_mode: data.economics_tax_mode,
+          economics_tax_rate: data.economics_tax_rate,
+          ...(data.api_key.trim() ? { api_key: data.api_key } : {}),
+        };
 
         const updatedStore = await storesAPI.update(store.id, payload);
         toast.success('Магазин обновлен');
@@ -531,6 +560,84 @@ export function StoreForm({ store, onClose, onSuccess }: StoreFormProps) {
               <p className="mt-1 text-sm text-red-600">{errors.api_key.message}</p>
             )}
           </div>
+
+          <section className="rounded-2xl border border-slate-200 bg-slate-50 p-4">
+            <div className="flex flex-col gap-1">
+              <h3 className="text-sm font-semibold text-slate-900">Налоги и НДС</h3>
+              <p className="text-xs text-slate-500">
+                Сохраним текущую налоговую схему магазина сразу при подключении. Историю с другими датами потом можно вести на странице налогов.
+              </p>
+            </div>
+
+            <div className="mt-4 grid gap-4 md:grid-cols-3">
+              <div>
+                <label htmlFor="economics_vat_mode" className="block text-sm font-medium text-gray-700">
+                  Режим НДС
+                </label>
+                <select
+                  id="economics_vat_mode"
+                  {...register('economics_vat_mode')}
+                  className="mt-1 block w-full rounded-md border-gray-300 bg-white shadow-sm focus:border-primary-500 focus:ring-primary-500 sm:text-sm text-gray-900"
+                >
+                  {VAT_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-1 text-xs text-slate-500">
+                  {VAT_OPTIONS.find((item) => item.value === economicsVatMode)?.note}
+                </p>
+              </div>
+
+              <div>
+                <label htmlFor="economics_tax_mode" className="block text-sm font-medium text-gray-700">
+                  Налоговая модель
+                </label>
+                <select
+                  id="economics_tax_mode"
+                  {...register('economics_tax_mode', {
+                    onChange: (event) => {
+                      const nextMode = event.target.value as TaxMode;
+                      setValue('economics_tax_rate', getTaxRatePreset(nextMode), { shouldDirty: true });
+                    },
+                  })}
+                  className="mt-1 block w-full rounded-md border-gray-300 bg-white shadow-sm focus:border-primary-500 focus:ring-primary-500 sm:text-sm text-gray-900"
+                >
+                  {TAX_OPTIONS.map((option) => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-1 text-xs text-slate-500">
+                  {TAX_OPTIONS.find((item) => item.value === economicsTaxMode)?.note}
+                </p>
+              </div>
+
+              <div>
+                <label htmlFor="economics_tax_rate" className="block text-sm font-medium text-gray-700">
+                  Ставка налога, %
+                </label>
+                <input
+                  type="number"
+                  id="economics_tax_rate"
+                  step="0.1"
+                  min="0"
+                  max="100"
+                  {...register('economics_tax_rate', {
+                    valueAsNumber: true,
+                    min: { value: 0, message: 'Ставка не может быть меньше 0%' },
+                    max: { value: 100, message: 'Ставка не может быть больше 100%' },
+                  })}
+                  className="mt-1 block w-full rounded-md border-gray-300 bg-white shadow-sm focus:border-primary-500 focus:ring-primary-500 sm:text-sm text-gray-900"
+                />
+                {errors.economics_tax_rate && (
+                  <p className="mt-1 text-sm text-red-600">{errors.economics_tax_rate.message}</p>
+                )}
+              </div>
+            </div>
+          </section>
 
           {!store && (
             <button
