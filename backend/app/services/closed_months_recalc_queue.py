@@ -102,7 +102,7 @@ class ClosedMonthsRecalcQueue:
         months = ClosedMonthHistoryService._closed_months_from_start(start_month)
         if not months:
             raise ValueError("Выбранный месяц позже последнего закрытого месяца Ozon")
-        return months[0]
+        return months[-1]
 
     def _normalize_state(self, store_id: int, payload: dict[str, Any] | None) -> dict[str, Any]:
         state = {**_default_state(store_id), **dict(payload or {})}
