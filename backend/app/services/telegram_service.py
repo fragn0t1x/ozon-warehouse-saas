@@ -418,6 +418,7 @@ class TelegramService:
                         for item in variants:
                             variant = item["variant"]
                             attrs = []
+                            offer_id = str(variant.get("offer_id") or "").strip()
 
                             if variant.get("color"):
                                 attrs.append(f"цвет: {variant['color']}")
@@ -427,7 +428,12 @@ class TelegramService:
                                 attrs.append(f"упаковка: {variant['pack_size']} шт")
 
                             attr_text = f" ({', '.join(attrs)})" if attrs else ""
-                            text += f"  •{attr_text}: {variant['quantity']} шт.\n"
+                            offer_text = f"артикул: {offer_id}" if offer_id else None
+                            details = [offer_text] if offer_text else []
+                            if attr_text:
+                                details.append(attr_text[2:-1] if attr_text.startswith(" (") and attr_text.endswith(")") else attr_text.strip("() "))
+                            details_text = f" ({', '.join(details)})" if details else ""
+                            text += f"  •{details_text}: {variant['quantity']} шт.\n"
 
                     text += (
                         f"\n<b>Итого по заявке:</b> "
