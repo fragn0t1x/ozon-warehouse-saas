@@ -15,7 +15,7 @@ class SupplyProcessing(Base):
     processed_type = Column(String, nullable=False)
     processed_at = Column(DateTime(timezone=True), server_default=func.now())
 
-    supply = relationship("Supply", backref="processing_records")
+    supply = relationship("Supply", back_populates="processing_records")
 
     def __repr__(self):
         return f"<SupplyProcessing supply_id={self.supply_id} type={self.processed_type}>"

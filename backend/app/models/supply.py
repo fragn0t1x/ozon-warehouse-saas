@@ -34,6 +34,12 @@ class Supply(Base):
         cascade="all, delete-orphan",
         passive_deletes=True,
     )
+    processing_records = relationship(
+        "SupplyProcessing",
+        back_populates="supply",
+        cascade="all, delete-orphan",
+        passive_deletes=True,
+    )
 
 class SupplyItem(Base):
     __tablename__ = "supply_items"
