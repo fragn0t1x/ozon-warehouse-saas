@@ -31,11 +31,47 @@ BOT_HEARTBEAT_INTERVAL_SECONDS = 15
 BOT_HEARTBEAT_TTL_SECONDS = 45
 
 
+def _split_telegram_text(text: str, limit: int = 4000) -> list[str]:
+    normalized = text.replace("<br/>", "\n").replace("<br>", "\n")
+    if len(normalized) <= limit:
+        return [normalized]
+
+    parts: list[str] = []
+    current = ""
+    for line in normalized.split("\n"):
+        candidate = f"{current}\n{line}" if current else line
+        if len(candidate) <= limit:
+            current = candidate
+            continue
+
+        if current:
+            parts.append(current)
+            current = ""
+
+        if len(line) <= limit:
+            current = line
+            continue
+
+        start = 0
+        while start < len(line):
+            chunk = line[start:start + limit]
+            parts.append(chunk)
+            start += limit
+
+    if current:
+        parts.append(current)
+    return parts or [normalized[:limit]]
+
+
 async def _replace_status(message: Message, status_message: Message, text: str, *, parse_mode: str | None = None):
+    parts = _split_telegram_text(text)
     try:
-        await status_message.edit_text(text, parse_mode=parse_mode)
+        await status_message.edit_text(parts[0], parse_mode=parse_mode)
     except Exception:
-        await message.answer(text, parse_mode=parse_mode)
+        await message.answer(parts[0], parse_mode=parse_mode)
+
+    for part in parts[1:]:
+        await message.answer(part, parse_mode=parse_mode)
 
 
 async def _get_linked_user_and_settings(db, chat_id: int | str):
