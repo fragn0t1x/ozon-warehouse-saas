@@ -45,6 +45,18 @@ function todayIsoDate() {
   return new Date().toISOString().slice(0, 10);
 }
 
+function parseDraftCost(value: string | null | undefined) {
+  const trimmed = (value || '').trim();
+  if (!trimmed) {
+    return { valid: true, value: null as number | null };
+  }
+  const parsed = Number(trimmed);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return { valid: false, value: null as number | null };
+  }
+  return { valid: true, value: parsed };
+}
+
 function monthStartIsoDate(month: string | null | undefined) {
   if (!month || !/^\d{4}-\d{2}$/.test(month)) {
     return null;
@@ -123,6 +135,7 @@ type ProductHistoryGroup = {
 
 type MissingCostVariant = {
   variant_id: number;
+  product_id: number;
   product_name: string;
   offer_id: string;
   color?: string | null;
@@ -132,6 +145,8 @@ type MissingCostVariant = {
 };
 
 type MissingCostProductGroup = {
+  key: string;
+  product_id: number;
   product_name: string;
   showPackSize: boolean;
   items: MissingCostVariant[];
@@ -148,7 +163,7 @@ export default function CostHistoryPage() {
   const [expandedVariantKey, setExpandedVariantKey] = useState<string | null>(null);
   const [costDrafts, setCostDrafts] = useState<Record<number, string>>({});
   const [effectiveDrafts, setEffectiveDrafts] = useState<Record<number, string>>({});
-  const [savingVariantId, setSavingVariantId] = useState<number | null>(null);
+  const [savingGroupKey, setSavingGroupKey] = useState<string | null>(null);
   const [deletingHistoryId, setDeletingHistoryId] = useState<number | null>(null);
   const [missingPage, setMissingPage] = useState(1);
   const [missingCostDefaultDate, setMissingCostDefaultDate] = useState(currentMonthStartIsoDate());
@@ -179,6 +194,7 @@ export default function CostHistoryPage() {
               }
               missingVariants.push({
                 variant_id: variant.id,
+                product_id: product.id,
                 product_name: product.name,
                 offer_id: variant.offer_id,
                 color: colorGroup.color,
@@ -273,9 +289,9 @@ export default function CostHistoryPage() {
   const latestChangedAt = history[0]?.effective_from ?? null;
   const missingCostCount = catalogMissingCostVariants.length;
   const missingGroupedProducts = useMemo<MissingCostProductGroup[]>(() => {
-    const groupedMap = new Map<string, MissingCostVariant[]>();
+    const groupedMap = new Map<number, MissingCostVariant[]>();
     for (const item of catalogMissingCostVariants) {
-      const key = item.product_name;
+      const key = item.product_id;
       if (!groupedMap.has(key)) {
         groupedMap.set(key, []);
       }
@@ -283,7 +299,7 @@ export default function CostHistoryPage() {
     }
 
     return Array.from(groupedMap.entries())
-      .map(([product_name, items]) => {
+      .map(([product_id, items]) => {
         const sortedItems = [...items].sort((a, b) => {
           const colorCompare = compareOptionalText(a.color, b.color);
           if (colorCompare !== 0) {
@@ -300,7 +316,9 @@ export default function CostHistoryPage() {
         });
 
         return {
-          product_name,
+          key: String(product_id),
+          product_id,
+          product_name: sortedItems[0]?.product_name || '',
           showPackSize: sortedItems.some((item) => item.pack_size !== 1),
           items: sortedItems,
         };
@@ -356,24 +374,91 @@ export default function CostHistoryPage() {
     });
   }, [catalogMissingCostVariants, missingCostDefaultDate]);
 
-  const saveVariantCost = async (variantId: number) => {
-    const rawValue = (costDrafts[variantId] ?? '').trim();
-    const nextValue = rawValue === '' ? null : Number(rawValue);
-    if (rawValue !== '' && (nextValue === null || !Number.isFinite(nextValue) || nextValue < 0)) {
-      toast.error('Введите корректную себестоимость');
+  const collectMissingGroupItems = useCallback((group: MissingCostProductGroup) => {
+    const items = group.items.flatMap((item) => {
+      const rawValue = costDrafts[item.variant_id];
+      const parsed = parseDraftCost(rawValue);
+      if (!parsed.valid) {
+        throw new Error(`Проверь себестоимость у вариации ${item.offer_id}`);
+      }
+      if ((rawValue || '').trim() === '') {
+        return [];
+      }
+      return [{
+        variant_id: item.variant_id,
+        unit_cost: parsed.value,
+        effective_from: effectiveDrafts[item.variant_id] || missingCostDefaultDate,
+      }];
+    });
+    return items;
+  }, [costDrafts, effectiveDrafts, missingCostDefaultDate]);
+
+  const collectHistoryProductItems = useCallback((productGroup: ProductHistoryGroup) => {
+    const items = productGroup.variants.flatMap((group) => {
+      const parsed = parseDraftCost(costDrafts[group.variant_id]);
+      if (!parsed.valid) {
+        throw new Error(`Проверь себестоимость у вариации ${group.offer_id}`);
+      }
+      const effectiveFrom = effectiveDrafts[group.variant_id] || todayIsoDate();
+      const latestUnitCost = group.latest.unit_cost ?? null;
+      const latestEffectiveFrom = group.latest.effective_from || todayIsoDate();
+      const hasChanges = parsed.value !== latestUnitCost || effectiveFrom !== latestEffectiveFrom;
+      if (!hasChanges) {
+        return [];
+      }
+      return [{
+        variant_id: group.variant_id,
+        unit_cost: parsed.value,
+        effective_from: effectiveFrom,
+      }];
+    });
+    return items;
+  }, [costDrafts, effectiveDrafts]);
+
+  const saveBatch = useCallback(async (groupKey: string, items: Array<{ variant_id: number; unit_cost: number | null; effective_from?: string | null }>, successMessage: string) => {
+    if (items.length === 0) {
+      toast.error('Сначала внеси изменения хотя бы в одну вариацию');
       return;
     }
 
-    setSavingVariantId(variantId);
+    setSavingGroupKey(groupKey);
     try {
-      await productsAPI.updateVariantCost(variantId, nextValue, effectiveDrafts[variantId] || null);
-      setCatalogMissingCostVariants((current) => current.filter((item) => item.variant_id !== variantId));
+      await productsAPI.updateVariantCostsBatch(items);
       await loadHistory();
-      toast.success('Себестоимость сохранена. История и закрытые месяцы обновятся автоматически.');
-    } catch {
-      toast.error('Не удалось сохранить себестоимость');
+      toast.success(successMessage);
+    } catch (error) {
+      const message = error instanceof Error ? error.message : '';
+      toast.error(message || 'Не удалось сохранить изменения себестоимости');
     } finally {
-      setSavingVariantId(null);
+      setSavingGroupKey(null);
+    }
+  }, [loadHistory]);
+
+  const saveMissingProductGroup = async (group: MissingCostProductGroup) => {
+    try {
+      const items = collectMissingGroupItems(group);
+      await saveBatch(
+        `missing-${group.key}`,
+        items,
+        'Себестоимость сохранена пачкой по товару. Закрытые месяцы пересчитаются автоматически одним общим запуском.',
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Не удалось подготовить изменения';
+      toast.error(message);
+    }
+  };
+
+  const saveHistoryProductGroup = async (productGroup: ProductHistoryGroup) => {
+    try {
+      const items = collectHistoryProductItems(productGroup);
+      await saveBatch(
+        `history-${productGroup.key}`,
+        items,
+        'Изменения по товару сохранены. Закрытые месяцы пересчитаются автоматически одним общим запуском.',
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'Не удалось подготовить изменения';
+      toast.error(message);
     }
   };
 
@@ -485,13 +570,23 @@ export default function CostHistoryPage() {
 
                   <div className="mt-4 space-y-3">
                     {pagedMissingGroups.map((group) => (
-                      <div key={`missing-group-${group.product_name}`} className="overflow-hidden rounded-2xl border border-white/90 bg-white shadow-sm">
+                      <div key={`missing-group-${group.key}`} className="overflow-hidden rounded-2xl border border-white/90 bg-white shadow-sm">
                         <div className="border-b border-slate-100 px-3.5 py-3">
                           <div className="flex flex-col gap-1.5 sm:flex-row sm:items-center sm:justify-between">
-                            <div className="text-sm font-semibold text-slate-950">{group.product_name}</div>
-                            <div className="text-xs text-slate-500">
-                              Вариаций без себестоимости: <span className="font-semibold text-slate-700">{group.items.length}</span>
+                            <div>
+                              <div className="text-sm font-semibold text-slate-950">{group.product_name}</div>
+                              <div className="mt-0.5 text-xs text-slate-500">
+                                Вариаций без себестоимости: <span className="font-semibold text-slate-700">{group.items.length}</span>
+                              </div>
                             </div>
+                            <button
+                              type="button"
+                              onClick={() => void saveMissingProductGroup(group)}
+                              disabled={savingGroupKey === `missing-${group.key}`}
+                              className="inline-flex items-center justify-center rounded-xl bg-slate-950 px-3.5 py-2 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+                            >
+                              {savingGroupKey === `missing-${group.key}` ? 'Сохраняем...' : 'Сохранить товар'}
+                            </button>
                           </div>
                         </div>
 
@@ -511,7 +606,6 @@ export default function CostHistoryPage() {
                                 ) : null}
                                 <th className="px-3.5 py-2 font-medium">Себестоимость</th>
                                 <th className="px-3.5 py-2 font-medium">Действует с</th>
-                                <th className="px-3.5 py-2 font-medium"></th>
                               </tr>
                             </thead>
                             <tbody>
@@ -555,16 +649,6 @@ export default function CostHistoryPage() {
                                       }
                                       className="block w-40 rounded-xl border border-slate-300 px-3 py-2 text-sm text-slate-900"
                                     />
-                                  </td>
-                                  <td className="px-3.5 py-2.5">
-                                    <button
-                                      type="button"
-                                      onClick={() => void saveVariantCost(item.variant_id)}
-                                      disabled={savingVariantId === item.variant_id}
-                                      className="inline-flex items-center justify-center rounded-xl bg-slate-950 px-3.5 py-2 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
-                                    >
-                                      {savingVariantId === item.variant_id ? '...' : 'Сохранить'}
-                                    </button>
                                   </td>
                                 </tr>
                               ))}
@@ -671,6 +755,16 @@ export default function CostHistoryPage() {
 
                           {isOpen && (
                             <div className="border-t border-slate-200 px-4 py-3">
+                              <div className="mb-3 flex justify-end">
+                                <button
+                                  type="button"
+                                  onClick={() => void saveHistoryProductGroup(productGroup)}
+                                  disabled={savingGroupKey === `history-${productGroup.key}`}
+                                  className="inline-flex items-center justify-center rounded-xl bg-slate-950 px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+                                >
+                                  {savingGroupKey === `history-${productGroup.key}` ? 'Сохраняем...' : 'Сохранить изменения по товару'}
+                                </button>
+                              </div>
                               <div className="space-y-3">
                                 {productGroup.variants.map((group) => {
                                   const isVariantOpen = expandedVariantKey === group.key;
@@ -710,15 +804,10 @@ export default function CostHistoryPage() {
                                             <div className="flex flex-col gap-2 lg:flex-row lg:items-end lg:justify-between">
                                               <div>
                                                 <div className="text-sm font-semibold text-slate-950">Добавить новое значение</div>
+                                                <div className="mt-1 text-xs text-slate-500">
+                                                  Изменения сохраняются общей кнопкой по товару выше.
+                                                </div>
                                               </div>
-                                              <button
-                                                type="button"
-                                                onClick={() => void saveVariantCost(group.variant_id)}
-                                                disabled={savingVariantId === group.variant_id}
-                                                className="inline-flex items-center justify-center rounded-xl bg-slate-950 px-4 py-2 text-sm font-medium text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
-                                              >
-                                                {savingVariantId === group.variant_id ? 'Сохраняем...' : 'Сохранить'}
-                                              </button>
                                             </div>
                                             <div className="mt-3 grid gap-2.5 sm:grid-cols-[1fr_165px_auto] sm:items-end">
                                               <div>

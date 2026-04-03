@@ -5,6 +5,7 @@ import sys
 import time
 import threading
 from types import SimpleNamespace
+from uuid import uuid4
 
 from billiard.exceptions import SoftTimeLimitExceeded
 from loguru import logger
@@ -48,9 +49,11 @@ try:
         mark_export_failed,
         mark_export_queued,
         mark_export_running,
+        mark_export_stale,
         mark_export_success,
         release_export_lock,
     )
+    from app.services.closed_months_recalc_queue import ClosedMonthsRecalcQueue
     from app.api.warehouse_router import get_warehouse_overview
     from app.api.shipments_router import get_shipments
     from app.core.dependencies import get_current_user
@@ -172,6 +175,26 @@ async def _scheduler_mark_background_requested(store_id: int, kind: str):
     return await scheduler().mark_background_requested(store_id, kind=kind)
 
 
+async def _closed_months_recalc_get_state(store_id: int):
+    return await ClosedMonthsRecalcQueue().get_state(store_id)
+
+
+async def _closed_months_recalc_get_revision(store_id: int):
+    return await ClosedMonthsRecalcQueue().get_revision(store_id)
+
+
+async def _closed_months_recalc_finish(store_id: int, task_id: str | None, success: bool):
+    if not task_id:
+        return {"status": "ignored", "store_id": store_id}
+    return await ClosedMonthsRecalcQueue().finish_task(store_id, task_id=task_id, success=success)
+
+
+async def _closed_months_recalc_release_claim(store_id: int, task_id: str | None):
+    if not task_id:
+        return None
+    await ClosedMonthsRecalcQueue().release_claim(store_id, task_id=task_id)
+
+
 def background_cooldown_key(store_id: int) -> str:
     return f"sync:background:cooldown:{store_id}"
 
@@ -236,7 +259,11 @@ def closed_months_are_pending_or_running(store_id: int) -> bool:
         return True
 
     queued_after_full = dict(state.get("queued_after_full") or {})
-    return str(queued_after_full.get("kind") or "") == "closed_months"
+    if str(queued_after_full.get("kind") or "") == "closed_months":
+        return True
+
+    recalc_state = run_async(_closed_months_recalc_get_state(store_id))
+    return bool(recalc_state.get("start_month") or recalc_state.get("inflight_task_id"))
 
 
 def closed_months_wait_message() -> str:
@@ -285,6 +312,38 @@ async def _resume_deferred_background_syncs_for_store(store_id: int) -> list[str
             ", ".join(resumed),
         )
     return resumed
+
+
+@celery.task(name='worker.tasks.dispatch_pending_closed_months_recalc_task')
+def dispatch_pending_closed_months_recalc_task():
+    queue = ClosedMonthsRecalcQueue()
+    store_ids = run_async(queue.list_store_ids())
+    dispatched: list[dict[str, object]] = []
+
+    for store_id in store_ids:
+        task_id = str(uuid4())
+        claim = run_async(queue.claim_ready(store_id, task_id=task_id))
+        if not claim:
+            continue
+
+        try:
+            sync_closed_month_history_task.apply_async(
+                args=[store_id, int(claim.get("months_requested") or 0), claim.get("start_month")],
+                task_id=task_id,
+            )
+            dispatched.append(
+                {
+                    "store_id": int(store_id),
+                    "task_id": task_id,
+                    "start_month": claim.get("start_month"),
+                    "months_requested": int(claim.get("months_requested") or 0),
+                }
+            )
+        except Exception:
+            run_async(queue.release_claim(store_id, task_id=task_id))
+            raise
+
+    return {"status": "ok", "dispatched": dispatched}
 
 
 async def _get_store_context(db, store_id: int):
@@ -1367,6 +1426,7 @@ def sync_closed_month_history_task(self, store_id: int, months_back: int = 3, st
     if not decision.allowed:
         logger.warning(f"⏳ Closed month history sync blocked for store {store_id}: {decision.message}")
         mark_store_kind_skipped(store_id, "closed_months", decision.message)
+        run_async(_closed_months_recalc_release_claim(store_id, task_id))
         return {"status": "skipped", "store_id": store_id, "reason": decision.action}
 
     if not acquire_named_sync_lock("closed_months", store_id, ttl_seconds=50 * 60):
@@ -1374,6 +1434,7 @@ def sync_closed_month_history_task(self, store_id: int, months_back: int = 3, st
         current_status = str(current_kind.get("status") or "")
         if current_status not in {"queued", "running"}:
             mark_store_kind_skipped(store_id, "closed_months", "Выгрузка истории закрытых месяцев уже выполняется")
+        run_async(_closed_months_recalc_release_claim(store_id, task_id))
         return {
             "status": "skipped",
             "store_id": store_id,
@@ -1518,12 +1579,14 @@ def sync_closed_month_history_task(self, store_id: int, months_back: int = 3, st
             end_month=latest_closed_month,
             current_month=None,
         )
+        run_async(_closed_months_recalc_finish(store_id, task_id, True))
         run_async(_scheduler_finish(store_id, "closed_months", task_id, True))
         run_async(_resume_deferred_background_syncs_for_store(store_id))
         return result
     except SoftTimeLimitExceeded as exc:
         logger.error(f"❌ Closed month history sync timed out for store {store_id}")
         mark_store_kind_failed(store_id, "closed_months", "Выгрузка истории закрытых месяцев превысила лимит времени")
+        run_async(_closed_months_recalc_finish(store_id, task_id, False))
         run_async(_scheduler_finish(store_id, "closed_months", task_id, False, "SoftTimeLimitExceeded()"))
         run_async(_resume_deferred_background_syncs_for_store(store_id))
         raise exc
@@ -1531,6 +1594,7 @@ def sync_closed_month_history_task(self, store_id: int, months_back: int = 3, st
         logger.error(f"❌ Closed month history sync failed for store {store_id}: {exc}")
         friendly_message = ClosedMonthHistoryService._friendly_month_error_message(exc)
         mark_store_kind_failed(store_id, "closed_months", friendly_message)
+        run_async(_closed_months_recalc_finish(store_id, task_id, False))
         run_async(_scheduler_finish(store_id, "closed_months", task_id, False, friendly_message))
         run_async(_resume_deferred_background_syncs_for_store(store_id))
         raise
@@ -1734,7 +1798,7 @@ def export_shipments_excel_task(
     soft_time_limit=25 * 60,
     time_limit=30 * 60,
 )
-def export_closed_months_excel_task(self, store_id: int, user_id: int, year: int):
+def export_closed_months_excel_task(self, store_id: int, user_id: int, year: int, cost_revision: int | None = None):
     task_id = getattr(self.request, "id", None) or f"closed-months-export-{store_id}-{year}"
     selection_label = f"{year} г."
     if not acquire_export_lock("closed_months", store_id, ttl_seconds=35 * 60):
@@ -1848,6 +1912,21 @@ def export_closed_months_excel_task(self, store_id: int, user_id: int, year: int
 
     try:
         result = run_async(_run())
+        current_revision = int(run_async(_closed_months_recalc_get_revision(store_id)) or 0)
+        if current_revision != int(cost_revision or 0):
+            try:
+                if os.path.exists(result["file_path"]):
+                    os.remove(result["file_path"])
+            except Exception:
+                pass
+            mark_export_stale(
+                "closed_months",
+                store_id,
+                user_id,
+                message="Во время формирования Excel изменилась себестоимость. Этот файл устарел, сформируй его заново.",
+            )
+            return {"status": "stale", **result}
+
         mark_export_success(
             "closed_months",
             store_id,

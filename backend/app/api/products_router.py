@@ -13,21 +13,15 @@ from app.models.store import Store
 from app.models.user import User
 from app.core.dependencies import get_current_user
 from app.services.cabinet_access import get_cabinet_owner_id
+from app.services.closed_months_recalc_queue import ClosedMonthsRecalcQueue
+from app.services.export_status import mark_store_exports_stale
 from app.services.product_grouping import extract_base_product_name, get_size_order, normalize_color
 from app.services.economics_history_service import EconomicsHistoryService
-from app.services.sync_dispatcher import enqueue_closed_month_history_sync
 from app.schemas.economics_history import VariantCostHistoryEntryResponse
 from typing import List, Optional
 from collections import defaultdict
 
 router = APIRouter(prefix="/products", tags=["products"])
-
-
-def _closed_months_backfill_window(effective_from: date | None) -> int:
-    value = effective_from or datetime.now(timezone.utc).date()
-    today = datetime.now(timezone.utc).date()
-    months = (today.year - value.year) * 12 + (today.month - value.month) + 1
-    return max(1, min(int(months), 36))
 
 
 def _closed_months_start_month(effective_from: date | None) -> str:
@@ -66,9 +60,113 @@ class BulkVariantCostUpdate(BaseModel):
     effective_from: date | None = None
 
 
+class BatchVariantCostUpdateItem(BaseModel):
+    variant_id: int
+    unit_cost: float | None = Field(default=None, ge=0)
+    effective_from: date | None = None
+
+
+class BatchVariantCostUpdatePayload(BaseModel):
+    items: List[BatchVariantCostUpdateItem] = Field(min_length=1, max_length=500)
+
+
 async def get_db():
     async with SessionLocal() as session:
         yield session
+
+
+def _closed_months_export_stale_message() -> str:
+    return "Себестоимость изменилась. Excel по закрытым месяцам устарел, сформируй его заново."
+
+
+async def _queue_closed_months_recalc_after_cost_change(store_recalc_from: dict[int, date]) -> dict[int, dict]:
+    queue = ClosedMonthsRecalcQueue()
+    results: dict[int, dict] = {}
+    for store_id, recalc_from in store_recalc_from.items():
+        mark_store_exports_stale(
+            "closed_months",
+            store_id,
+            message=_closed_months_export_stale_message(),
+        )
+        results[store_id] = await queue.queue(
+            store_id,
+            start_month=_closed_months_start_month(recalc_from),
+        )
+    return results
+
+
+async def _apply_variant_cost_batch_updates(
+    *,
+    items: List[BatchVariantCostUpdateItem],
+    db: AsyncSession,
+    current_user: User,
+) -> tuple[dict[int, Variant], dict[int, date], set[int]]:
+    item_by_variant_id = {int(item.variant_id): item for item in items}
+    variant_ids = sorted(item_by_variant_id)
+
+    stmt = (
+        select(Variant, Product.warehouse_product_id)
+        .join(Product, Product.id == Variant.product_id)
+        .join(Store, Store.id == Product.store_id)
+        .options(selectinload(Variant.attributes), selectinload(Variant.product))
+        .where(
+            Variant.id.in_(variant_ids),
+            Store.user_id == get_cabinet_owner_id(current_user),
+        )
+    )
+    result = await db.execute(stmt)
+    rows = result.all()
+    if not rows:
+        raise HTTPException(status_code=404, detail="Вариации не найдены")
+
+    found_variant_ids = {int(variant.id) for variant, _warehouse_product_id in rows}
+    missing_variant_ids = [variant_id for variant_id in variant_ids if variant_id not in found_variant_ids]
+    if missing_variant_ids:
+        raise HTTPException(
+            status_code=404,
+            detail=f"Не найдены вариации: {', '.join(str(item) for item in missing_variant_ids)}",
+        )
+
+    economics_service = EconomicsHistoryService(db)
+    history_variants_by_effective_from: dict[date, list[tuple[Variant, int | None, dict[str, str]]]] = defaultdict(list)
+    touched_store_effective_from: dict[int, date] = {}
+    touched_product_ids: set[int] = set()
+    variants_by_id: dict[int, Variant] = {}
+
+    for variant, warehouse_product_id in rows:
+        item = item_by_variant_id[int(variant.id)]
+        normalized_effective_from = item.effective_from or datetime.now(timezone.utc).date()
+        variant.unit_cost = item.unit_cost
+        attributes = {attr.name: attr.value for attr in variant.attributes}
+        history_variants_by_effective_from[normalized_effective_from].append((variant, warehouse_product_id, attributes))
+        touched_product_ids.add(int(variant.product_id))
+        variants_by_id[int(variant.id)] = variant
+
+        store_id = int(variant.product.store_id)
+        current_earliest = touched_store_effective_from.get(store_id)
+        if current_earliest is None or normalized_effective_from < current_earliest:
+            touched_store_effective_from[store_id] = normalized_effective_from
+
+    for effective_from, history_variants in history_variants_by_effective_from.items():
+        await economics_service.ensure_variant_cost_history_entries(
+            variants=history_variants,
+            effective_from=effective_from,
+            created_by_user_id=current_user.id,
+        )
+
+    recalc_from_by_store: dict[int, date] = {}
+    for store_id, effective_from in touched_store_effective_from.items():
+        earliest_needs_cost_month = await _earliest_store_month_needing_cost(db, store_id)
+        recalc_from = min(effective_from, earliest_needs_cost_month) if earliest_needs_cost_month else effective_from
+        recalc_from_by_store[store_id] = recalc_from
+        await economics_service.unlock_store_months_from_date(
+            store_id=store_id,
+            effective_from=recalc_from,
+        )
+
+    await db.commit()
+    await _queue_closed_months_recalc_after_cost_change(recalc_from_by_store)
+    return variants_by_id, recalc_from_by_store, touched_product_ids
 
 
 async def _get_grouped_products(
@@ -334,12 +432,9 @@ async def delete_cost_history_entry(
 
     await db.commit()
 
-    for touched_store_id in touched_store_ids:
-        enqueue_closed_month_history_sync(
-            touched_store_id,
-            months_back=_closed_months_backfill_window(target_history.effective_from),
-            start_month=_closed_months_start_month(target_history.effective_from),
-        )
+    await _queue_closed_months_recalc_after_cost_change(
+        {touched_store_id: target_history.effective_from for touched_store_id in touched_store_ids}
+    )
 
     return {"status": "success", "message": "Запись истории себестоимости удалена"}
 
@@ -351,57 +446,20 @@ async def update_variant_cost(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    stmt = (
-        select(Variant, Product.warehouse_product_id)
-        .join(Product, Product.id == Variant.product_id)
-        .join(Store, Store.id == Product.store_id)
-        .options(selectinload(Variant.attributes), selectinload(Variant.product))
-        .where(
-            Variant.id == variant_id,
-            Store.user_id == get_cabinet_owner_id(current_user),
-        )
+    variants_by_id, _recalc_from_by_store, _touched_product_ids = await _apply_variant_cost_batch_updates(
+        items=[
+            BatchVariantCostUpdateItem(
+                variant_id=variant_id,
+                unit_cost=payload.unit_cost,
+                effective_from=payload.effective_from,
+            )
+        ],
+        db=db,
+        current_user=current_user,
     )
-    result = await db.execute(stmt)
-    row = result.first()
-    if not row:
+    variant = variants_by_id.get(variant_id)
+    if not variant:
         raise HTTPException(status_code=404, detail="Вариация не найдена")
-    variant, warehouse_product_id = row
-
-    source_attributes = {attr.name: attr.value for attr in variant.attributes}
-    variant.unit_cost = payload.unit_cost
-    history_variants: list[tuple[Variant, int | None, dict[str, str]]] = [
-        (variant, warehouse_product_id, source_attributes)
-    ]
-
-    await EconomicsHistoryService(db).ensure_variant_cost_history_entries(
-        variants=history_variants,
-        effective_from=payload.effective_from,
-        created_by_user_id=current_user.id,
-    )
-    effective_from = payload.effective_from or datetime.now(timezone.utc).date()
-    touched_store_ids = {
-        int(current_variant.product.store_id)
-        for current_variant, _current_warehouse_product_id, _attributes in history_variants
-    }
-    recalc_from_by_store: dict[int, date] = {}
-    for touched_store_id in touched_store_ids:
-        earliest_needs_cost_month = await _earliest_store_month_needing_cost(db, touched_store_id)
-        recalc_from = min(effective_from, earliest_needs_cost_month) if earliest_needs_cost_month else effective_from
-        recalc_from_by_store[touched_store_id] = recalc_from
-        await EconomicsHistoryService(db).unlock_store_months_from_date(
-            store_id=touched_store_id,
-            effective_from=recalc_from,
-        )
-
-    await db.commit()
-    await db.refresh(variant)
-    for touched_store_id in touched_store_ids:
-        recalc_from = recalc_from_by_store[touched_store_id]
-        enqueue_closed_month_history_sync(
-            touched_store_id,
-            months_back=_closed_months_backfill_window(recalc_from),
-            start_month=_closed_months_start_month(recalc_from),
-        )
     return {
         "id": variant.id,
         "unit_cost": variant.unit_cost,
@@ -446,45 +504,41 @@ async def update_grouped_product_cost(
     if not variants:
         raise HTTPException(status_code=404, detail="Вариации для массового обновления не найдены")
 
-    updated_product_ids = {variant.product_id for variant in variants}
-    history_variants: list[tuple[Variant, int | None, dict[str, str]]] = []
-    for variant in variants:
-        variant.unit_cost = payload.unit_cost
-        warehouse_product_id = int(variant.product.warehouse_product_id) if variant.product.warehouse_product_id is not None else None
-        attributes = {attr.name: attr.value for attr in variant.attributes}
-        history_variants.append((variant, warehouse_product_id, attributes))
-
-    await EconomicsHistoryService(db).ensure_variant_cost_history_entries(
-        variants=history_variants,
-        effective_from=payload.effective_from,
-        created_by_user_id=current_user.id,
+    updated_product_ids = {int(variant.product_id) for variant in variants}
+    _, _recalc_from_by_store, _ = await _apply_variant_cost_batch_updates(
+        items=[
+            BatchVariantCostUpdateItem(
+                variant_id=int(variant.id),
+                unit_cost=payload.unit_cost,
+                effective_from=payload.effective_from,
+            )
+            for variant in variants
+        ],
+        db=db,
+        current_user=current_user,
     )
-    effective_from = payload.effective_from or datetime.now(timezone.utc).date()
-    touched_store_ids = {
-        int(current_variant.product.store_id)
-        for current_variant, _current_warehouse_product_id, _attributes in history_variants
-    }
-    recalc_from_by_store: dict[int, date] = {}
-    for touched_store_id in touched_store_ids:
-        earliest_needs_cost_month = await _earliest_store_month_needing_cost(db, touched_store_id)
-        recalc_from = min(effective_from, earliest_needs_cost_month) if earliest_needs_cost_month else effective_from
-        recalc_from_by_store[touched_store_id] = recalc_from
-        await EconomicsHistoryService(db).unlock_store_months_from_date(
-            store_id=touched_store_id,
-            effective_from=recalc_from,
-        )
-
-    await db.commit()
-    for touched_store_id in touched_store_ids:
-        recalc_from = recalc_from_by_store[touched_store_id]
-        enqueue_closed_month_history_sync(
-            touched_store_id,
-            months_back=_closed_months_backfill_window(recalc_from),
-            start_month=_closed_months_start_month(recalc_from),
-        )
 
     return {
         "updated_variants": len(variants),
         "updated_products": len(updated_product_ids),
         "unit_cost": payload.unit_cost,
+    }
+
+
+@router.post("/costs/batch")
+async def update_variant_costs_batch(
+    payload: BatchVariantCostUpdatePayload,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    variants_by_id, recalc_from_by_store, touched_product_ids = await _apply_variant_cost_batch_updates(
+        items=payload.items,
+        db=db,
+        current_user=current_user,
+    )
+    return {
+        "updated_variants": len(variants_by_id),
+        "updated_products": len(touched_product_ids),
+        "affected_stores": sorted(recalc_from_by_store),
+        "queued_recalc": True,
     }

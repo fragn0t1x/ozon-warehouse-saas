@@ -21,6 +21,7 @@ from app.services.export_status import (
     has_export_lock,
     mark_export_queued,
 )
+from app.services.closed_months_recalc_queue import ClosedMonthsRecalcQueue
 from app.services.sync_dispatcher import (
     celery_app,
     cancel_closed_month_history_sync,
@@ -185,6 +186,11 @@ async def start_closed_months_export(
     )
     if not any(str(item.month).startswith(f"{year}-") for item in months):
         raise HTTPException(status_code=404, detail=f"За {year} год нет закрытых месяцев")
+    if await ClosedMonthsRecalcQueue().has_pending(store_id):
+        raise HTTPException(
+            status_code=409,
+            detail="После изменений себестоимости закрытые месяцы еще пересчитываются. Дождись завершения и сформируй Excel заново.",
+        )
 
     current_status = get_export_status("closed_months", store_id, current_user.id)
     if has_export_lock("closed_months", store_id) or current_status.get("status") in {"queued", "running"}:
@@ -200,7 +206,7 @@ async def start_closed_months_export(
 
     task = celery_app.send_task(
         "worker.tasks.export_closed_months_excel_task",
-        args=[store_id, current_user.id, year],
+        args=[store_id, current_user.id, year, await ClosedMonthsRecalcQueue().get_revision(store_id)],
     )
     return mark_export_queued(
         "closed_months",

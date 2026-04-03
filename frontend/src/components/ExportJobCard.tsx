@@ -26,6 +26,8 @@ function statusBadge(status: ExportJobStatus | null) {
       return { label: status?.phase_label || 'Выполняется', className: 'bg-sky-50 text-sky-700 border-sky-200' };
     case 'success':
       return { label: 'Готово', className: 'bg-emerald-50 text-emerald-700 border-emerald-200' };
+    case 'stale':
+      return { label: 'Устарело', className: 'bg-orange-50 text-orange-700 border-orange-200' };
     case 'error':
       return { label: 'Ошибка', className: 'bg-rose-50 text-rose-700 border-rose-200' };
     default:
@@ -79,7 +81,8 @@ export function ExportJobCard({
   const canClear = !isBusy && !!onClear && (
     !!status?.file_name ||
     (status?.recent_runs?.length ?? 0) > 0 ||
-    status?.status === 'error'
+    status?.status === 'error' ||
+    status?.status === 'stale'
   );
   const recentRuns = status?.recent_runs ?? [];
 
@@ -133,13 +136,15 @@ export function ExportJobCard({
         </div>
       </div>
 
-      {(status?.status === 'queued' || status?.status === 'running' || status?.status === 'success' || status?.status === 'error') ? (
+      {(status?.status === 'queued' || status?.status === 'running' || status?.status === 'success' || status?.status === 'error' || status?.status === 'stale') ? (
         <div className="mt-4">
           <div className="h-2.5 overflow-hidden rounded-full bg-slate-100">
             <div
               className={`h-full rounded-full transition-all ${
                 status?.status === 'error'
                   ? 'bg-rose-500'
+                  : status?.status === 'stale'
+                    ? 'bg-orange-500'
                   : status?.status === 'success'
                     ? 'bg-emerald-500'
                     : 'bg-sky-500'

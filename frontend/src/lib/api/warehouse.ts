@@ -86,7 +86,7 @@ export interface WarehouseOverview {
 export interface ExportJobStatus {
   kind: string;
   store_id: number;
-  status: 'idle' | 'queued' | 'running' | 'success' | 'error';
+  status: 'idle' | 'queued' | 'running' | 'success' | 'error' | 'stale';
   message: string;
   phase?: string | null;
   phase_label?: string | null;

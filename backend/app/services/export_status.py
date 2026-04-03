@@ -25,6 +25,10 @@ def export_status_key(kind: str, store_id: int, user_id: int) -> str:
     return f"export:status:{kind}:{store_id}:{user_id}"
 
 
+def export_status_pattern(kind: str, store_id: int) -> str:
+    return f"export:status:{kind}:{store_id}:*"
+
+
 def export_lock_key(kind: str, store_id: int) -> str:
     return f"export:lock:{kind}:{store_id}"
 
@@ -337,3 +341,38 @@ def clear_export_status(kind: str, store_id: int, user_id: int) -> dict[str, Any
     _cleanup_previous_file(current)
     redis_client.delete(export_status_key(kind, store_id, user_id))
     return _empty_status(kind, store_id, user_id)
+
+
+def mark_export_stale(kind: str, store_id: int, user_id: int, *, message: str) -> dict[str, Any]:
+    current = get_export_status(kind, store_id, user_id)
+    _cleanup_previous_file(current)
+    return set_export_status(
+        kind,
+        store_id,
+        user_id,
+        status="stale",
+        message=message,
+        phase="stale",
+        phase_label="Устарело",
+        progress_percent=0,
+        finished_at=_now_iso(),
+        task_id=None,
+        file_path=None,
+        file_name=None,
+        download_url=None,
+        error=None,
+    )
+
+
+def mark_store_exports_stale(kind: str, store_id: int, *, message: str) -> int:
+    touched = 0
+    try:
+        for key in redis_client.scan_iter(match=export_status_pattern(kind, store_id), count=100):
+            user_id = str(key).rsplit(":", 1)[-1]
+            if not user_id.isdigit():
+                continue
+            mark_export_stale(kind, store_id, int(user_id), message=message)
+            touched += 1
+    except Exception:
+        return touched
+    return touched

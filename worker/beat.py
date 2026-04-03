@@ -64,6 +64,10 @@ celery.conf.update(
             'task': 'worker.tasks.sync_finance_snapshots_all',
             'schedule': crontab(minute='*/15'),
         },
+        'dispatch-pending-closed-months-recalc': {
+            'task': 'worker.tasks.dispatch_pending_closed_months_recalc_task',
+            'schedule': crontab(minute='*'),
+        },
     },
     timezone='Europe/Moscow',  # Меняем на московское время
 )

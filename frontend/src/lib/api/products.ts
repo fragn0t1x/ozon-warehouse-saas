@@ -45,6 +45,12 @@ export interface Product {
   variants: Variant[];
 }
 
+export interface BatchVariantCostUpdateItem {
+  variant_id: number;
+  unit_cost: number | null;
+  effective_from?: string | null;
+}
+
 const EMPTY_VARIANT: Variant = {
   id: 0,
   offer_id: '',
@@ -179,6 +185,24 @@ export const productsAPI = {
       updated_variants: 0,
       updated_products: 0,
       unit_cost: unitCost,
+    });
+  },
+
+  updateVariantCostsBatch: async (
+    items: BatchVariantCostUpdateItem[]
+  ): Promise<{ updated_variants: number; updated_products: number; affected_stores: number[]; queued_recalc: boolean }> => {
+    const response = await apiClient.post('/products/costs/batch', {
+      items: items.map((item) => ({
+        variant_id: item.variant_id,
+        unit_cost: item.unit_cost,
+        effective_from: item.effective_from ?? null,
+      })),
+    });
+    return ensureObject(response.data, {
+      updated_variants: 0,
+      updated_products: 0,
+      affected_stores: [] as number[],
+      queued_recalc: false,
     });
   },
 };
