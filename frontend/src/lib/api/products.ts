@@ -189,7 +189,8 @@ export const productsAPI = {
   },
 
   updateVariantCostsBatch: async (
-    items: BatchVariantCostUpdateItem[]
+    items: BatchVariantCostUpdateItem[],
+    deleteHistoryIds: number[] = [],
   ): Promise<{ updated_variants: number; updated_products: number; affected_stores: number[]; queued_recalc: boolean }> => {
     const response = await apiClient.post('/products/costs/batch', {
       items: items.map((item) => ({
@@ -197,6 +198,7 @@ export const productsAPI = {
         unit_cost: item.unit_cost,
         effective_from: item.effective_from ?? null,
       })),
+      delete_history_ids: deleteHistoryIds,
     });
     return ensureObject(response.data, {
       updated_variants: 0,

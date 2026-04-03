@@ -124,6 +124,9 @@ type VariantHistoryGroup = {
   is_archived: boolean;
   latest: VariantCostHistoryEntry;
   items: VariantCostHistoryEntry[];
+  activeItems: VariantCostHistoryEntry[];
+  pendingDeleteCount: number;
+  allPendingDelete: boolean;
 };
 
 type ProductHistoryGroup = {
@@ -164,7 +167,7 @@ export default function CostHistoryPage() {
   const [costDrafts, setCostDrafts] = useState<Record<number, string>>({});
   const [effectiveDrafts, setEffectiveDrafts] = useState<Record<number, string>>({});
   const [savingGroupKey, setSavingGroupKey] = useState<string | null>(null);
-  const [deletingHistoryId, setDeletingHistoryId] = useState<number | null>(null);
+  const [pendingDeletedHistoryIds, setPendingDeletedHistoryIds] = useState<Record<number, true>>({});
   const [missingPage, setMissingPage] = useState(1);
   const [missingCostDefaultDate, setMissingCostDefaultDate] = useState(currentMonthStartIsoDate());
 
@@ -227,6 +230,7 @@ export default function CostHistoryPage() {
     for (const item of history) {
       const key = `${item.variant_id}`;
       if (!map.has(key)) {
+        const isPendingDelete = Boolean(pendingDeletedHistoryIds[item.id]);
         map.set(key, {
           key,
           product_name: item.product_name,
@@ -238,13 +242,24 @@ export default function CostHistoryPage() {
           is_archived: item.is_archived,
           latest: item,
           items: [item],
+          activeItems: isPendingDelete ? [] : [item],
+          pendingDeleteCount: isPendingDelete ? 1 : 0,
+          allPendingDelete: isPendingDelete,
         });
         continue;
       }
-      map.get(key)!.items.push(item);
+      const group = map.get(key)!;
+      group.items.push(item);
+      if (pendingDeletedHistoryIds[item.id]) {
+        group.pendingDeleteCount += 1;
+      } else {
+        group.activeItems.push(item);
+      }
     }
     const byProduct = new Map<string, ProductHistoryGroup>();
     for (const variantGroup of Array.from(map.values())) {
+      variantGroup.allPendingDelete = variantGroup.activeItems.length === 0;
+      variantGroup.latest = variantGroup.activeItems[0] ?? variantGroup.items[0];
       const productKey = String(variantGroup.latest.product_id);
       if (!byProduct.has(productKey)) {
         byProduct.set(productKey, {
@@ -260,7 +275,7 @@ export default function CostHistoryPage() {
       ...productGroup,
       variants: productGroup.variants.sort((a, b) => a.offer_id.localeCompare(b.offer_id, 'ru')),
     }));
-  }, [history]);
+  }, [history, pendingDeletedHistoryIds]);
 
   const filtered = useMemo(() => {
     const query = search.trim().toLowerCase();
@@ -374,6 +389,10 @@ export default function CostHistoryPage() {
     });
   }, [catalogMissingCostVariants, missingCostDefaultDate]);
 
+  useEffect(() => {
+    setPendingDeletedHistoryIds({});
+  }, [selectedStoreId]);
+
   const collectMissingGroupItems = useCallback((group: MissingCostProductGroup) => {
     const items = group.items.flatMap((item) => {
       const rawValue = costDrafts[item.variant_id];
@@ -399,10 +418,15 @@ export default function CostHistoryPage() {
       if (!parsed.valid) {
         throw new Error(`Проверь себестоимость у вариации ${group.offer_id}`);
       }
-      const effectiveFrom = effectiveDrafts[group.variant_id] || todayIsoDate();
-      const latestUnitCost = group.latest.unit_cost ?? null;
-      const latestEffectiveFrom = group.latest.effective_from || todayIsoDate();
-      const hasChanges = parsed.value !== latestUnitCost || effectiveFrom !== latestEffectiveFrom;
+      const effectiveFrom = effectiveDrafts[group.variant_id] || group.latest.effective_from || todayIsoDate();
+      const latestUnitCost = group.activeItems[0]?.unit_cost ?? null;
+      const latestEffectiveFrom = group.activeItems[0]?.effective_from || effectiveFrom;
+      if (parsed.value == null && latestUnitCost == null) {
+        return [];
+      }
+      const hasChanges =
+        parsed.value !== latestUnitCost ||
+        (parsed.value !== null && effectiveFrom !== latestEffectiveFrom);
       if (!hasChanges) {
         return [];
       }
@@ -415,16 +439,39 @@ export default function CostHistoryPage() {
     return items;
   }, [costDrafts, effectiveDrafts]);
 
-  const saveBatch = useCallback(async (groupKey: string, items: Array<{ variant_id: number; unit_cost: number | null; effective_from?: string | null }>, successMessage: string) => {
-    if (items.length === 0) {
+  const collectHistoryDeleteIds = useCallback((productGroup: ProductHistoryGroup) => {
+    return productGroup.variants.flatMap((group) =>
+      group.items
+        .filter((item) => pendingDeletedHistoryIds[item.id])
+        .map((item) => item.id)
+    );
+  }, [pendingDeletedHistoryIds]);
+
+  const saveBatch = useCallback(async (
+    groupKey: string,
+    items: Array<{ variant_id: number; unit_cost: number | null; effective_from?: string | null }>,
+    deleteHistoryIds: number[],
+    successMessage: string,
+  ) => {
+    if (items.length === 0 && deleteHistoryIds.length === 0) {
       toast.error('Сначала внеси изменения хотя бы в одну вариацию');
       return;
     }
 
     setSavingGroupKey(groupKey);
     try {
-      await productsAPI.updateVariantCostsBatch(items);
+      await productsAPI.updateVariantCostsBatch(items, deleteHistoryIds);
       await loadHistory();
+      setPendingDeletedHistoryIds((current) => {
+        if (deleteHistoryIds.length === 0) {
+          return current;
+        }
+        const next = { ...current };
+        for (const historyId of deleteHistoryIds) {
+          delete next[historyId];
+        }
+        return next;
+      });
       toast.success(successMessage);
     } catch (error) {
       const message = error instanceof Error ? error.message : '';
@@ -440,6 +487,7 @@ export default function CostHistoryPage() {
       await saveBatch(
         `missing-${group.key}`,
         items,
+        [],
         'Себестоимость сохранена пачкой по товару. Закрытые месяцы пересчитаются автоматически одним общим запуском.',
       );
     } catch (error) {
@@ -451,10 +499,14 @@ export default function CostHistoryPage() {
   const saveHistoryProductGroup = async (productGroup: ProductHistoryGroup) => {
     try {
       const items = collectHistoryProductItems(productGroup);
+      const deleteHistoryIds = collectHistoryDeleteIds(productGroup);
       await saveBatch(
         `history-${productGroup.key}`,
         items,
-        'Изменения по товару сохранены. Закрытые месяцы пересчитаются автоматически одним общим запуском.',
+        deleteHistoryIds,
+        deleteHistoryIds.length > 0 && items.length === 0
+          ? 'Удаления сохранены. Закрытые месяцы пересчитаются автоматически одним общим запуском.'
+          : 'Изменения по товару сохранены. Закрытые месяцы пересчитаются автоматически одним общим запуском.',
       );
     } catch (error) {
       const message = error instanceof Error ? error.message : 'Не удалось подготовить изменения';
@@ -466,20 +518,73 @@ export default function CostHistoryPage() {
     const isLastEntry = group.items.length <= 1;
     const confirmMessage = isLastEntry
       ? 'Удалить последнюю запись себестоимости? У вариации больше не будет задана себестоимость, а затронутые месяцы пересчитаются автоматически.'
-      : 'Удалить эту запись из истории себестоимости? Затронутые месяцы пересчитаются автоматически.';
+      : 'Убрать эту запись из истории? Изменение применится после кнопки сохранения по товару.';
     if (!window.confirm(confirmMessage)) {
       return;
     }
-    setDeletingHistoryId(historyId);
-    try {
-      await economicsHistoryAPI.deleteVariantCostHistory(historyId);
-      await loadHistory();
-      toast.success('Запись истории удалена');
-    } catch (error) {
-      const message = error instanceof Error ? error.message : '';
-      toast.error(message || 'Не удалось удалить запись истории');
-    } finally {
-      setDeletingHistoryId(null);
+    const deletedEntry = group.items.find((item) => item.id === historyId) ?? null;
+    const remainingActiveItems = group.items.filter(
+      (item) => item.id !== historyId && !pendingDeletedHistoryIds[item.id]
+    );
+    const nextLatest = remainingActiveItems[0] ?? null;
+
+    setPendingDeletedHistoryIds((current) => ({ ...current, [historyId]: true }));
+    if (deletedEntry) {
+      setCostDrafts((current) => {
+        const currentDraft = current[group.variant_id] ?? '';
+        const deletedValue = deletedEntry.unit_cost != null ? String(deletedEntry.unit_cost) : '';
+        if (currentDraft !== deletedValue) {
+          return current;
+        }
+        return {
+          ...current,
+          [group.variant_id]: nextLatest?.unit_cost != null ? String(nextLatest.unit_cost) : '',
+        };
+      });
+      setEffectiveDrafts((current) => {
+        const currentDraft = current[group.variant_id] ?? deletedEntry.effective_from ?? todayIsoDate();
+        if (currentDraft !== deletedEntry.effective_from) {
+          return current;
+        }
+        return {
+          ...current,
+          [group.variant_id]: nextLatest?.effective_from ?? todayIsoDate(),
+        };
+      });
+    }
+    toast('Запись помечена на удаление. Нажми «Сохранить изменения по товару».');
+  };
+
+  const restoreHistoryEntry = (group: VariantHistoryGroup, historyId: number) => {
+    const restoredEntry = group.items.find((item) => item.id === historyId) ?? null;
+    setPendingDeletedHistoryIds((current) => {
+      const next = { ...current };
+      delete next[historyId];
+      return next;
+    });
+    if (restoredEntry) {
+      setCostDrafts((current) => {
+        const currentDraft = current[group.variant_id] ?? '';
+        const activeValue = group.activeItems[0]?.unit_cost != null ? String(group.activeItems[0].unit_cost) : '';
+        if (currentDraft !== activeValue) {
+          return current;
+        }
+        return {
+          ...current,
+          [group.variant_id]: restoredEntry.unit_cost != null ? String(restoredEntry.unit_cost) : '',
+        };
+      });
+      setEffectiveDrafts((current) => {
+        const currentDraft = current[group.variant_id] ?? group.activeItems[0]?.effective_from ?? todayIsoDate();
+        const activeDate = group.activeItems[0]?.effective_from ?? todayIsoDate();
+        if (currentDraft !== activeDate) {
+          return current;
+        }
+        return {
+          ...current,
+          [group.variant_id]: restoredEntry.effective_from ?? todayIsoDate(),
+        };
+      });
     }
   };
 
@@ -768,6 +873,7 @@ export default function CostHistoryPage() {
                               <div className="space-y-3">
                                 {productGroup.variants.map((group) => {
                                   const isVariantOpen = expandedVariantKey === group.key;
+                                  const hasPendingDeletes = group.pendingDeleteCount > 0;
                                   return (
                                     <div key={group.key} className="rounded-2xl border border-white bg-white shadow-sm">
                                       <button
@@ -783,13 +889,24 @@ export default function CostHistoryPage() {
                                                 Архив
                                               </span>
                                             )}
+                                            {hasPendingDeletes && (
+                                              <span className="inline-flex rounded-full bg-amber-100 px-2.5 py-1 text-[11px] font-medium text-amber-800">
+                                                Удаление не сохранено
+                                              </span>
+                                            )}
                                           </div>
-                                          <div className="mt-0.5 text-sm text-slate-500">Себестоимость: {formatCurrency(group.latest.unit_cost)}</div>
+                                          <div className="mt-0.5 text-sm text-slate-500">
+                                            {group.allPendingDelete
+                                              ? 'После сохранения у вариации не останется себестоимости'
+                                              : `Себестоимость: ${formatCurrency(group.latest.unit_cost)}`}
+                                          </div>
                                         </div>
                                         <div className="grid gap-2 text-right sm:grid-cols-2 sm:gap-4">
                                           <div>
                                             <div className="text-xs uppercase tracking-[0.16em] text-slate-400">Действует с</div>
-                                            <div className="mt-0.5 text-sm font-semibold text-slate-950">{formatDate(group.latest.effective_from)}</div>
+                                            <div className="mt-0.5 text-sm font-semibold text-slate-950">
+                                              {group.allPendingDelete ? 'Будет очищено' : formatDate(group.latest.effective_from)}
+                                            </div>
                                           </div>
                                           <div>
                                             <div className="text-xs uppercase tracking-[0.16em] text-slate-400">Изменений</div>
@@ -844,10 +961,22 @@ export default function CostHistoryPage() {
                                               <div className="text-[11px] text-slate-500 sm:pb-2">Пересчет с этой даты</div>
                                             </div>
                                           </div>
+                                          {hasPendingDeletes ? (
+                                            <div className="mb-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-3 text-xs text-amber-900">
+                                              Удаление записей пока только подготовлено. Нажми «Сохранить изменения по товару», чтобы применить его вместе с остальными правками.
+                                            </div>
+                                          ) : null}
 
                                           <div className="space-y-2">
                                             {group.items.map((item, index) => (
-                                              <div key={item.id} className="rounded-2xl border border-slate-200 bg-slate-50 px-3.5 py-3">
+                                              <div
+                                                key={item.id}
+                                                className={`rounded-2xl border px-3.5 py-3 ${
+                                                  pendingDeletedHistoryIds[item.id]
+                                                    ? 'border-amber-200 bg-amber-50 opacity-80'
+                                                    : 'border-slate-200 bg-slate-50'
+                                                }`}
+                                              >
                                                 <div className="grid gap-2 sm:grid-cols-[1fr_auto_auto] sm:items-center sm:gap-3">
                                                   <div>
                                                     <div className="flex flex-wrap items-center gap-2">
@@ -855,6 +984,11 @@ export default function CostHistoryPage() {
                                                       <span className={`inline-flex rounded-full px-2.5 py-1 text-[11px] font-medium ${index === 0 ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-100 text-slate-700'}`}>
                                                         {index === 0 ? 'Текущее значение' : 'Историческая запись'}
                                                       </span>
+                                                      {pendingDeletedHistoryIds[item.id] ? (
+                                                        <span className="inline-flex rounded-full bg-amber-100 px-2.5 py-1 text-[11px] font-medium text-amber-800">
+                                                          Будет удалено
+                                                        </span>
+                                                      ) : null}
                                                     </div>
                                                     <div className="mt-0.5 text-xs text-slate-500">{new Intl.DateTimeFormat('ru-RU', {
                                                       day: '2-digit',
@@ -868,11 +1002,20 @@ export default function CostHistoryPage() {
                                                   <div className="flex justify-end">
                                                     <button
                                                       type="button"
-                                                      onClick={() => void deleteHistoryEntry(group, item.id)}
-                                                      disabled={deletingHistoryId === item.id}
-                                                      className="inline-flex rounded-xl border border-rose-200 bg-white px-3 py-1.5 text-xs font-medium text-rose-700 transition hover:bg-rose-50 disabled:cursor-not-allowed disabled:opacity-50"
+                                                      onClick={() => {
+                                                        if (pendingDeletedHistoryIds[item.id]) {
+                                                          restoreHistoryEntry(group, item.id);
+                                                          return;
+                                                        }
+                                                        void deleteHistoryEntry(group, item.id);
+                                                      }}
+                                                      className={`inline-flex rounded-xl border bg-white px-3 py-1.5 text-xs font-medium transition ${
+                                                        pendingDeletedHistoryIds[item.id]
+                                                          ? 'border-slate-300 text-slate-700 hover:bg-slate-50'
+                                                          : 'border-rose-200 text-rose-700 hover:bg-rose-50'
+                                                      }`}
                                                     >
-                                                      {deletingHistoryId === item.id ? 'Удаляем...' : 'Удалить'}
+                                                      {pendingDeletedHistoryIds[item.id] ? 'Вернуть' : 'Удалить'}
                                                     </button>
                                                   </div>
                                                 </div>

@@ -1,7 +1,7 @@
 # backend/app/api/products_router.py
 from datetime import date, datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import delete, select
 from sqlalchemy.orm import selectinload
@@ -67,7 +67,14 @@ class BatchVariantCostUpdateItem(BaseModel):
 
 
 class BatchVariantCostUpdatePayload(BaseModel):
-    items: List[BatchVariantCostUpdateItem] = Field(min_length=1, max_length=500)
+    items: List[BatchVariantCostUpdateItem] = Field(default_factory=list, max_length=500)
+    delete_history_ids: List[int] = Field(default_factory=list, max_length=500)
+
+    @model_validator(mode="after")
+    def validate_has_operations(self):
+        if not self.items and not self.delete_history_ids:
+            raise ValueError("Нужны изменения или удаления")
+        return self
 
 
 async def get_db():
@@ -166,6 +173,142 @@ async def _apply_variant_cost_batch_updates(
 
     await db.commit()
     await _queue_closed_months_recalc_after_cost_change(recalc_from_by_store)
+    return variants_by_id, recalc_from_by_store, touched_product_ids
+
+
+async def _apply_variant_cost_batch_changes(
+    *,
+    items: List[BatchVariantCostUpdateItem],
+    delete_history_ids: List[int],
+    db: AsyncSession,
+    current_user: User,
+) -> tuple[dict[int, Variant], dict[int, date], set[int]]:
+    cabinet_owner_id = get_cabinet_owner_id(current_user)
+    economics_service = EconomicsHistoryService(db)
+
+    item_by_variant_id = {int(item.variant_id): item for item in items}
+    variant_ids = sorted(item_by_variant_id)
+    touched_store_effective_from: dict[int, date] = {}
+    touched_product_ids: set[int] = set()
+    touched_variant_ids: set[int] = set()
+    variants_by_id: dict[int, Variant] = {}
+
+    if variant_ids:
+        stmt = (
+            select(Variant, Product.warehouse_product_id)
+            .join(Product, Product.id == Variant.product_id)
+            .join(Store, Store.id == Product.store_id)
+            .options(selectinload(Variant.attributes), selectinload(Variant.product))
+            .where(
+                Variant.id.in_(variant_ids),
+                Store.user_id == cabinet_owner_id,
+            )
+        )
+        result = await db.execute(stmt)
+        rows = result.all()
+        if not rows:
+            raise HTTPException(status_code=404, detail="Вариации не найдены")
+
+        found_variant_ids = {int(variant.id) for variant, _warehouse_product_id in rows}
+        missing_variant_ids = [variant_id for variant_id in variant_ids if variant_id not in found_variant_ids]
+        if missing_variant_ids:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Не найдены вариации: {', '.join(str(item) for item in missing_variant_ids)}",
+            )
+
+        history_variants_by_effective_from: dict[date, list[tuple[Variant, int | None, dict[str, str]]]] = defaultdict(list)
+
+        for variant, warehouse_product_id in rows:
+            item = item_by_variant_id[int(variant.id)]
+            normalized_effective_from = item.effective_from or datetime.now(timezone.utc).date()
+            attributes = {attr.name: attr.value for attr in variant.attributes}
+            history_variants_by_effective_from[normalized_effective_from].append((variant, warehouse_product_id, attributes))
+            touched_product_ids.add(int(variant.product_id))
+            touched_variant_ids.add(int(variant.id))
+            variants_by_id[int(variant.id)] = variant
+
+            store_id = int(variant.product.store_id)
+            current_earliest = touched_store_effective_from.get(store_id)
+            if current_earliest is None or normalized_effective_from < current_earliest:
+                touched_store_effective_from[store_id] = normalized_effective_from
+
+        for effective_from, history_variants in history_variants_by_effective_from.items():
+            await economics_service.ensure_variant_cost_history_entries(
+                variants=history_variants,
+                effective_from=effective_from,
+                created_by_user_id=current_user.id,
+            )
+
+    if delete_history_ids:
+        delete_stmt = (
+            select(VariantCostHistory, Variant, Product)
+            .join(Variant, Variant.id == VariantCostHistory.variant_id)
+            .join(Product, Product.id == Variant.product_id)
+            .join(Store, Store.id == Product.store_id)
+            .options(selectinload(Variant.product), selectinload(Variant.attributes))
+            .where(
+                VariantCostHistory.id.in_(delete_history_ids),
+                Store.user_id == cabinet_owner_id,
+            )
+        )
+        delete_rows = (await db.execute(delete_stmt)).all()
+        found_history_ids = {int(history.id) for history, _variant, _product in delete_rows}
+        missing_history_ids = [history_id for history_id in delete_history_ids if history_id not in found_history_ids]
+        if missing_history_ids:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Не найдены записи истории: {', '.join(str(item) for item in missing_history_ids)}",
+            )
+
+        for history_entry, variant, product in delete_rows:
+            touched_variant_ids.add(int(variant.id))
+            touched_product_ids.add(int(product.id))
+            variants_by_id[int(variant.id)] = variant
+            store_id = int(product.store_id)
+            current_earliest = touched_store_effective_from.get(store_id)
+            if current_earliest is None or history_entry.effective_from < current_earliest:
+                touched_store_effective_from[store_id] = history_entry.effective_from
+
+        await db.execute(delete(VariantCostHistory).where(VariantCostHistory.id.in_(delete_history_ids)))
+        await db.flush()
+
+    if not touched_variant_ids:
+        return variants_by_id, {}, touched_product_ids
+
+    latest_history_by_variant: dict[int, VariantCostHistory | None] = {}
+    for variant_id in touched_variant_ids:
+        latest = (
+            await db.execute(
+                select(VariantCostHistory)
+                .where(VariantCostHistory.variant_id == variant_id)
+                .order_by(VariantCostHistory.effective_from.desc(), VariantCostHistory.id.desc())
+                .limit(1)
+            )
+        ).scalars().first()
+        latest_history_by_variant[variant_id] = latest
+
+    for variant_id in touched_variant_ids:
+        variant = variants_by_id.get(variant_id) or await db.get(Variant, variant_id)
+        if variant is None:
+            continue
+        latest = latest_history_by_variant.get(variant_id)
+        variant.unit_cost = float(latest.unit_cost) if latest and latest.unit_cost is not None else None
+        variants_by_id[variant_id] = variant
+
+    recalc_from_by_store: dict[int, date] = {}
+    for store_id, effective_from in touched_store_effective_from.items():
+        earliest_needs_cost_month = await _earliest_store_month_needing_cost(db, store_id)
+        recalc_from = min(effective_from, earliest_needs_cost_month) if earliest_needs_cost_month else effective_from
+        recalc_from_by_store[store_id] = recalc_from
+        await economics_service.unlock_store_months_from_date(
+            store_id=store_id,
+            effective_from=recalc_from,
+        )
+
+    await db.commit()
+    if recalc_from_by_store:
+        await _queue_closed_months_recalc_after_cost_change(recalc_from_by_store)
     return variants_by_id, recalc_from_by_store, touched_product_ids
 
 
@@ -531,8 +674,9 @@ async def update_variant_costs_batch(
     db: AsyncSession = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    variants_by_id, recalc_from_by_store, touched_product_ids = await _apply_variant_cost_batch_updates(
+    variants_by_id, recalc_from_by_store, touched_product_ids = await _apply_variant_cost_batch_changes(
         items=payload.items,
+        delete_history_ids=payload.delete_history_ids,
         db=db,
         current_user=current_user,
     )
@@ -540,5 +684,5 @@ async def update_variant_costs_batch(
         "updated_variants": len(variants_by_id),
         "updated_products": len(touched_product_ids),
         "affected_stores": sorted(recalc_from_by_store),
-        "queued_recalc": True,
+        "queued_recalc": bool(recalc_from_by_store),
     }
