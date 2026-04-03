@@ -14,6 +14,8 @@ export default function AdminUsersPage() {
   const [users, setUsers] = useState<User[]>([]);
   const [loading, setLoading] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [resettingUserId, setResettingUserId] = useState<number | null>(null);
+  const [successMessage, setSuccessMessage] = useState<string | null>(null);
   const [generatedPassword, setGeneratedPassword] = useState<string | null>(null);
   const [form, setForm] = useState({
     email: '',
@@ -138,11 +140,13 @@ export default function AdminUsersPage() {
     }
 
     try {
+      setResettingUserId(targetUser.id);
+      setSuccessMessage(null);
       const result = await adminAPI.resetUser(targetUser.id);
-      toast.success(
-        `Кабинет сброшен: магазинов удалено ${result.deleted_stores}`
-      );
       await loadUsers();
+      const nextMessage = `Кабинет пользователя ${targetUser.email} сброшен: магазинов удалено ${result.deleted_stores}`;
+      setSuccessMessage(nextMessage);
+      toast.success(nextMessage);
     } catch (error: unknown) {
       const message =
         typeof error === 'object' &&
@@ -159,6 +163,8 @@ export default function AdminUsersPage() {
           : 'Не удалось сбросить кабинет пользователя';
 
       toast.error(message);
+    } finally {
+      setResettingUserId(null);
     }
   };
 
@@ -185,6 +191,12 @@ export default function AdminUsersPage() {
             </p>
           </div>
         </div>
+
+        {successMessage && (
+          <div className="mb-6 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
+            {successMessage}
+          </div>
+        )}
 
         <div className="mb-8 grid grid-cols-1 gap-4 md:grid-cols-3">
           <div className="rounded-lg bg-white p-5 shadow">
@@ -295,9 +307,10 @@ export default function AdminUsersPage() {
                           <button
                             type="button"
                             onClick={() => resetUser(item)}
+                            disabled={resettingUserId === item.id}
                             className="rounded-md border border-amber-200 px-3 py-1.5 text-sm text-amber-700 hover:bg-amber-50"
                           >
-                            Сбросить
+                            {resettingUserId === item.id ? 'Сброс...' : 'Сбросить'}
                           </button>
                           <button
                             type="button"
