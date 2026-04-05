@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { Suspense, useEffect, useMemo, useState } from 'react';
 import { useRouter, useSearchParams } from 'next/navigation';
 import {
   ArrowPathIcon,
@@ -57,7 +57,7 @@ function getProgress(status: StoreSyncStatus | null) {
   return status?.status === 'running' ? 16 : 8;
 }
 
-export default function OnboardingSyncPage() {
+function OnboardingSyncPageContent() {
   const router = useRouter();
   const searchParams = useSearchParams();
   const { bootstrapStoreId, refreshBootstrapStatus, user } = useAuth();
@@ -304,5 +304,23 @@ export default function OnboardingSyncPage() {
         </div>
       </div>
     </ProtectedRoute>
+  );
+}
+
+function OnboardingSyncFallback() {
+  return (
+    <ProtectedRoute>
+      <div className="min-h-screen flex items-center justify-center">
+        <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-primary-600"></div>
+      </div>
+    </ProtectedRoute>
+  );
+}
+
+export default function OnboardingSyncPage() {
+  return (
+    <Suspense fallback={<OnboardingSyncFallback />}>
+      <OnboardingSyncPageContent />
+    </Suspense>
   );
 }
